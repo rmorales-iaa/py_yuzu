@@ -1,0 +1,41 @@
+Acknowledgements
+----------------
+
+This list, hopefully complete and in chronological order, is a compendium of
+all the people who contributed and whom I would like to thank. I am deeply
+grateful for the ideas, enthusiastic questions, thorough answers and moral
+support received during these years, and look forward to the day on which
+somebody finally submits a patch. See you at GitHub! -- Víctor
+
+Matilde Fernández, aka The Mastermind (also, the Principal Investigator)
+Nuria Huélamo, a loyal companion at the Fortress of Solitude (1.23m CAHA)
+Nicolás Cardiel, for his help on error propagation (via email)
+Frank Valdes, on qphot and stars saturation (the IRAF.net forums)
+
+Michael Newberry,
+Jim Jones,
+Gary Walker and
+Bradley Walter [AAVSO-Photometry mailing list]
+
+Hernán J. González, also helped on error propagation (at Math Stack Exchange)
+César Husillos, for his help on image alignment through cross-correlation
+Ilse Plauchu, for her useful comments on Gaussian distribution fitting
+Emmanuel Bertin, for the ample and diligent help with SExtractor
+Javier Blasco, our most enthusiastic user, for such thoughtful suggestions
+Pablo Ramírez, the second person to ever use LEMON — that we know of
+Sofía León, for designing for us such a marvelous LEMON icon
+José Enrique Ruiz, for suggesting that we set extglob
+Jean-Baptiste Marquette, for reporting a bug under Mac OS X
+Scott Engle, for the many bugs diligently reported
+Juha Sahakangas, for the workaround for GTK+ bug 632538
+Felipe Gallego, for reporting a bug in get__version__()
+Muhammad Yusuf, for reporting bugs in the unit tests
+Pablo Galindo, our most relentless bug hunter
+Jorge Gómez, for reporting a bug with PyFITS > 3.2
+Ted Groner, for reporting a bug in the unit tests on 32-bit IRAF
+William Schoenell, for helping debug the aforementioned bug
+Emilio Falco, for the many bugs perseveringly reported
+Hervé Bouy, for the help and advice on Astrometry.net
+Michael Hlabathe, for reporting a bug in the unit tests.
+Derek O'Keeffe, for the bug fix for load_coordinates().
+Ana Karla Díaz (@akdiaz), for the help debugging `juicer`.

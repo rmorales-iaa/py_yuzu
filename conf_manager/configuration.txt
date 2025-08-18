@@ -1,0 +1,55 @@
+[theme]
+font_name = DejaVu Sans
+font_size = 14
+background = #2a2f38
+foreground = #e7ebef
+accent = #ffd84d
+blue = #0d6efd
+divider = #ffd84d
+row_selected = #375a7f
+
+[main_window]
+width = 1286
+height = 887
+x = 
+y = 
+maximized = false
+remember_position = true
+remember_size = true
+font_name = 
+font_size = 
+background = 
+foreground = 
+
+[star_window]
+width = 1098
+height = 748
+x = 
+y = 
+maximized = false
+ratio_top = 0.60
+ratio_plot = 0.62
+ratio_bottom_left = 0.50
+remember_position = true
+remember_size = true
+font_name = 
+font_size = 
+background = 
+foreground = 
+
+[find_chart]
+width = 808
+height = 809
+x = 
+y = 
+maximized = false
+remember_position = true
+remember_size = true
+font_name = 
+font_size = 
+background = 
+foreground = 
+radius_arcmin = 6.0
+recenter_one_sided_cloud = true
+font_family = DejaVu Sans
+
