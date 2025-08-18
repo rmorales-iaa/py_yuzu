@@ -17,98 +17,104 @@ from gi.repository import Gtk, Gio, Gdk, Pango, GLib  # type: ignore
 from .models import StarRow
 from .utils import _import_miner_class
 
+# Configuration manager (colors, geometry, column widths)
+from conf_manager.conf_manager import cfg
+
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Optional configuration manager (preferred). If missing, we fall back to
-# a local CSS installer and default sizes.
-# -----------------------------------------------------------------------------
-try:
-    from conf_manager.conf_manager import cfg  # type: ignore
-    _HAVE_CFG = True
-except Exception:  # fallback stubs
-    _HAVE_CFG = False
+# ----------------------------------------------------------------------
+# Styles that reference @define-color variables injected by ConfigManager
+# ----------------------------------------------------------------------
+CSS = """
+/* Colors are injected by cfg.install_css_for_display():
+   @lemon-bg, @lemon-fg, @lemon-accent, @lemon-blue, @lemon-divider, @lemon-row-sel */
 
-    class _CfgFallback:
-        _css = b"""
-        @define-color lemon-bg        #2a2f38;
-        @define-color lemon-fg        #e7ebef;
-        @define-color lemon-accent    #ffd84d;
-        @define-color lemon-row-sel   #375a7f;
-        @define-color lemon-blue      #0d6efd;
-        @define-color lemon-divider   #ffd84d;
+.lemon-surface {
+  background-color: @lemon-bg;
+}
 
-        .lemon-surface { background-color: @lemon-bg; }
-        .lemon-surface, .lemon-surface * { color: @lemon-fg; }
+.lemon-surface, .lemon-surface * {
+  color: @lemon-fg;
+}
 
-        scrolledwindow.lemon-scroller,
-        scrolledwindow.lemon-scroller viewport,
-        scrolledwindow.lemon-scroller viewport > *,
-        columnview.lemon-dark,
-        columnview.lemon-dark > *,
-        columnview.lemon-dark listview,
-        columnview.lemon-dark listview > *,
-        columnview.lemon-dark row,
-        columnview.lemon-dark row > * { background-color: @lemon-bg; }
+/* ColumnView dark background */
+scrolledwindow.lemon-scroller,
+scrolledwindow.lemon-scroller viewport,
+scrolledwindow.lemon-scroller viewport > *,
+columnview.lemon-dark,
+columnview.lemon-dark > *,
+columnview.lemon-dark listview,
+columnview.lemon-dark listview > *,
+columnview.lemon-dark row,
+columnview.lemon-dark row > * {
+  background-color: @lemon-bg;
+}
 
-        columnview.lemon-dark label { color: @lemon-fg; }
+columnview.lemon-dark label {
+  color: @lemon-fg;
+}
 
-        columnview.lemon-dark row:selected { background-color: @lemon-row-sel; }
-        columnview.lemon-dark row:selected label { color: @lemon-accent; }
+/* Selected row */
+columnview.lemon-dark row:selected {
+  background-color: @lemon-row-sel;
+}
+columnview.lemon-dark row:selected label {
+  color: @lemon-accent;
+}
 
-        columnview.lemon-dark > header { background-color: @lemon-blue; }
-        columnview.lemon-dark > header button {
-          background-image: none; background-color: transparent;
-          color: #ffffff; border-color: transparent;
-        }
-        columnview.lemon-dark > header button label { color: #ffffff; }
+/* Column header styling */
+columnview.lemon-dark > header {
+  background-color: @lemon-blue;
+}
+columnview.lemon-dark > header button {
+  background-image: none;
+  background-color: transparent;
+  color: #ffffff;
+  border-color: transparent;
+}
+columnview.lemon-dark > header button label {
+  color: #ffffff;
+}
 
-        columnview.lemon-dark row > * { border-left: 1px solid @lemon-divider; }
-        columnview.lemon-dark row > *:first-child { border-left: none; }
-        columnview.lemon-dark > header > * { border-left: 1px solid @lemon-divider; }
-        columnview.lemon-dark > header > *:first-child { border-left: none; }
+/* Vertical dividers in rows and headers */
+columnview.lemon-dark row > * {
+  border-left: 1px solid @lemon-divider;
+}
+columnview.lemon-dark row > *:first-child {
+  border-left: none;
+}
+columnview.lemon-dark > header > * {
+  border-left: 1px solid @lemon-divider;
+}
+columnview.lemon-dark > header > *:first-child {
+  border-left: none;
+}
 
-        .lemon-statusbar { background-color: @lemon-bg; padding: 6px 10px; }
-        .lemon-statusbar * { color: @lemon-accent; }
+/* Status bar */
+.lemon-statusbar {
+  background-color: @lemon-bg;
+  padding: 6px 10px;
+}
+.lemon-statusbar * {
+  color: @lemon-accent;
+}
 
-        .lemon-btn {
-          background: none; background-color: @lemon-bg; color: @lemon-accent;
-          border: 1px solid @lemon-accent; border-radius: 6px; padding: 6px 10px;
-        }
-        .lemon-btn:hover { filter: brightness(1.08); }
-        .lemon-btn:disabled { opacity: 0.6; }
-        """
-
-        def install_css_for_display(self, display: Gdk.Display | None) -> None:
-            if not display:
-                display = Gdk.Display.get_default()
-            if not display:
-                return
-            prov = Gtk.CssProvider()
-            prov.load_from_data(self._css)
-            Gtk.StyleContext.add_provider_for_display(
-                display, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
-
-        # simple getters
-        def get(self, section: str, key: str, default: str = "") -> str:
-            return default
-
-        def getint(self, section: str, key: str, default: int) -> int:
-            return default
-
-        def getfloat(self, section: str, key: str, default: float) -> float:
-            return default
-
-        def getbool(self, section: str, key: str, default: bool) -> bool:
-            return default
-
-        # geometry persistence no-ops
-        def attach_window(self, win: Gtk.Window, section: str) -> None:
-            return
-
-    cfg = _CfgFallback()  # type: ignore
-
+/* Buttons: dark bg + yellow text */
+.lemon-btn {
+  background: none;
+  background-color: @lemon-bg;
+  color: @lemon-accent;
+  border: 1px solid @lemon-accent;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.lemon-btn:hover {
+  filter: brightness(1.08);
+}
+.lemon-btn:disabled {
+  opacity: 0.6;
+}
+"""
 
 class LEMONJuicerWindow(Gtk.ApplicationWindow):
     """GTK4 main window with a ColumnView listing stars from the DB."""
@@ -116,37 +122,55 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application, title_suffix: str = ""):
         super().__init__(application=app, title=f"LEMON Juicer{title_suffix}")
 
-        # Install theme CSS (from config or fallback)
-        try:
-            cfg.install_css_for_display(Gdk.Display.get_default())
-        except Exception:
-            pass
+        # Install theme colors from configuration first (defines @lemon-* variables)
+        cfg.install_css_for_display(Gdk.Display.get_default())
 
-        # Size from configuration (fallback to 1200x800)
-        w = cfg.getint("main_window", "width", 1200)
-        h = cfg.getint("main_window", "height", 800)
-        self.set_default_size(w, h)
+        # Now load our app CSS that uses the variables
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        # Geometry: default size from config + attach persistence
+        self.set_default_size(
+            cfg.getint("main_window", "width", 1200),
+            cfg.getint("main_window", "height", 800),
+        )
+        cfg.attach_window(self, "main_window")
 
         # ---------- HeaderBar ----------
         hb = Gtk.HeaderBar.new()
         self.set_titlebar(hb)
 
         open_btn = Gtk.Button.new_from_icon_name("document-open-symbolic")
-        open_btn.set_tooltip_text("Open LEMON database?")
+        open_btn.set_tooltip_text("Open LEMON database…")
         open_btn.add_css_class("lemon-btn")
         open_btn.connect("clicked", self._on_open_clicked)
         hb.pack_start(open_btn)
 
         quit_btn = Gtk.Button(label="Quit")
         quit_btn.add_css_class("lemon-btn")
-        quit_btn.connect("clicked", lambda *_: self.get_application().quit())
+
+        def _on_quit(_btn):
+            # Save final geometry synchronously before quitting
+            try:
+                cfg.save_window_geometry(self, "main_window", flush=True)
+            finally:
+                app = self.get_application()
+                if app:
+                    app.quit()
+
+        quit_btn.connect("clicked", _on_quit)
         hb.pack_end(quit_btn)
 
         # ---------- Root layout ----------
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.add_css_class("lemon-surface")
         root.set_hexpand(True)
         root.set_vexpand(True)
-        root.add_css_class("lemon-surface")
         self.set_child(root)
 
         # ---------- Model ----------
@@ -192,8 +216,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             col = Gtk.ColumnViewColumn(title=title, factory=factory)
             col.set_resizable(True)
             col.set_expand(expand)
-            if width_chars is not None and not expand:
-                col.set_fixed_width(int(width_chars * 9 + 24))  # rough monospace char?px
+            # Do not set fixed width here; cfg.attach_column will apply a saved width
             return col
 
         # ---------- ColumnView (table) ----------
@@ -205,55 +228,40 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # Double-click / Enter activation -> open details
         self._view.connect("activate", self._on_view_activate)
 
-        # Columns: ID (fixed), Mag (fixed), RA (expand), Dec (expand)
-        self._view.append_column(
-            make_text_column(
-                "ID",
-                "id",
-                width_chars=9,
-                xalign=1.0,
-                monospace=True,
-                expand=False,
-                label_width_chars=9,
-                formatter=lambda v: "" if v is None else f"{int(v)}",
-            )
+        # Build columns and attach persistence of widths
+        # ID
+        col_id = make_text_column(
+            "ID", "id",
+            width_chars=9, xalign=1.0, monospace=True, expand=False, label_width_chars=9,
+            formatter=lambda v: "" if v is None else f"{int(v)}",
         )
-        self._view.append_column(
-            make_text_column(
-                "Mag",
-                "imag",
-                width_chars=8,
-                xalign=1.0,
-                monospace=True,
-                expand=False,
-                label_width_chars=8,
-                formatter=lambda v: ""
-                if (v is None or (isinstance(v, float) and math.isnan(v)))
-                else f"{float(v):.3f}",
-            )
+        self._view.append_column(col_id)
+        cfg.attach_column(col_id, key="id", default_px=cfg.getint("main_columns", "id", 105), resizable=True)
+
+        # Mag
+        col_mag = make_text_column(
+            "Mag", "imag",
+            width_chars=8, xalign=1.0, monospace=True, expand=False, label_width_chars=8,
+            formatter=lambda v: "" if (v is None or (isinstance(v, float) and math.isnan(v))) else f"{float(v):.3f}",
         )
-        self._view.append_column(
-            make_text_column(
-                "RA (hms)",
-                "ra_str",
-                width_chars=None,
-                xalign=0.0,
-                monospace=True,
-                expand=True,
-                label_width_chars=20,
-            )
+        self._view.append_column(col_mag)
+        cfg.attach_column(col_mag, key="mag", default_px=cfg.getint("main_columns", "mag", 96), resizable=True)
+
+        # RA (expand)
+        col_ra = make_text_column(
+            "RA (hms)", "ra_str",
+            width_chars=None, xalign=0.0, monospace=True, expand=True, label_width_chars=20,
         )
-        self._view.append_column(
-            make_text_column(
-                "Dec (dms)",
-                "dec_str",
-                width_chars=None,
-                xalign=0.0,
-                monospace=True,
-                expand=True,
-                label_width_chars=20,
-            )
+        self._view.append_column(col_ra)
+        cfg.attach_column(col_ra, key="ra", default_px=cfg.getint("main_columns", "ra", 240), resizable=True)
+
+        # Dec (expand)
+        col_dec = make_text_column(
+            "Dec (dms)", "dec_str",
+            width_chars=None, xalign=0.0, monospace=True, expand=True, label_width_chars=20,
         )
+        self._view.append_column(col_dec)
+        cfg.attach_column(col_dec, key="dec", default_px=cfg.getint("main_columns", "dec", 240), resizable=True)
 
         # ---------- Scroller ----------
         scroller = Gtk.ScrolledWindow.new()
@@ -277,16 +285,13 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         self._miner = None
         self._db_path: Optional[str] = None
         self._file_dlg: Optional[Gtk.FileChooserNative] = None
-        self._details_win = None  # created on demand
+        self._details_win: Optional[Gtk.Window] = None
 
-        # Persist geometry/position via cfg (no-op in fallback)
-        try:
-            cfg.attach_window(self, "main_window")
-        except Exception:
-            pass
-
-        # Center main window at startup if no stored position (X11 best-effort)
-        GLib.idle_add(self._center_main_window_once)
+        # Center on first run if requested and no saved position
+        if cfg.getbool("main_window", "center_on_start", True) and \
+           cfg.getint("main_window", "last_x", -1) < 0 and \
+           cfg.getint("main_window", "last_y", -1) < 0:
+            GLib.idle_add(self._center_main_window_once)
 
     # ---- UI helpers ----
     def _set_status(self, text: str) -> None:
@@ -294,7 +299,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
     def _show_error(self, message: str, title: str = "Error") -> None:
         logger.error("%s", message)
-        # Try a notification
         try:
             n = Gio.Notification.new(title)
             n.set_body(message)
@@ -304,20 +308,14 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 app.send_notification(None, n)
         except Exception:
             pass
-        # Always print to stderr
         print(f"{title}: {message}", file=sys.stderr)
 
     # ---- Centering (best-effort on X11/VNC) ----
     def _center_main_window_once(self) -> bool:
         try:
-            # If a position was remembered by cfg, don't re-center
-            if _HAVE_CFG and (cfg.get("main_window", "x", "") or cfg.get("main_window", "y", "")):
-                return False
-
             surface = self.get_surface()
             if surface is None or surface.get_width() == 0 or surface.get_height() == 0:
-                # Try again until we have a real surface size
-                return True
+                return True  # retry until we have dimensions
 
             display = Gdk.Display.get_default()
             if not display:
@@ -333,7 +331,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             target_x = int(rect.x + (rect.width - win_w) / 2)
             target_y = int(rect.y + (rect.height - win_h) / 2)
 
-            # X11-specific move via GdkX11 + libX11 (best effort)
+            # X11-specific move via GdkX11 + libX11 (Wayland usually ignores manual moves)
             try:
                 gi.require_version("GdkX11", "4.0")
                 from gi.repository import GdkX11  # type: ignore
@@ -381,19 +379,30 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             self._open_details_for(item)
 
     def _open_details_for(self, item: StarRow) -> None:
+        # Lazy import so errors inside star_window.py are surfaced clearly
         try:
-            from .star_window import StarDetailsWindow
+            from . import star_window as _star
+            StarDetailsWindow = getattr(_star, "StarDetailsWindow", None)
+            if StarDetailsWindow is None:
+                raise ImportError("juicer.star_window.StarDetailsWindow is not defined")
+        except Exception as e:
+            import traceback
+            self._show_error(f"Failed to import Star Details window module:\n{traceback.format_exc()}")
+            return
+
+        try:
             self._details_win = StarDetailsWindow(self, item, self._miner)
             self._details_win.present()
         except Exception as e:
-            self._show_error(f"Failed to build Star Details window:\n{e}")
+            import traceback
+            self._show_error(f"Failed to build Star Details window:\n{traceback.format_exc()}")
 
     # ---- Open handlers ----
     def _on_open_clicked(self, _btn: Gtk.Button) -> None:
         self._show_open_dialog()
 
     def _show_open_dialog(self) -> None:
-        # Robust across distros: FileChooserNative survives GC; keep as a field
+        # Keep a reference so native dialog isn't GC'ed while open
         dlg = Gtk.FileChooserNative.new(
             "Open LEMON database",
             self,
@@ -418,9 +427,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                         if path:
                             self.open_db(path)
             finally:
-                # Explicitly destroy and drop ref so it doesn't linger
                 dialog.destroy()
-                if getattr(self, "_file_dlg", None) is dialog:
+                if self._file_dlg is dialog:
                     self._file_dlg = None
 
         dlg.connect("response", on_response)
@@ -446,14 +454,14 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"LEMON Juicer ? {Path(db_path).name}")
+        self.set_title(f"LEMON Juicer: {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
 
         self._populate_overview_from_miner(miner)
 
     def _populate_overview_from_miner(self, miner) -> None:
         """Fill the ColumnView with star rows + update status line."""
-        # Safely reset store
+        # Reset store safely
         try:
             self._rows.remove_all()
         except Exception:
@@ -473,4 +481,4 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         n_filters = len(getattr(miner, "pfilters", []))
         field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
-        self._set_status(f"Field: {field} ? Stars shown: {n_added} ? Filters: {n_filters}")
+        self._set_status(f"Field: {field} — Stars shown: {n_added} — Filters: {n_filters}")

@@ -1,6 +1,6 @@
 [theme]
-font_name = DejaVu Sans
-font_size = 14
+font_name = Cantarell
+font_size = 11
 background = #2a2f38
 foreground = #e7ebef
 accent = #ffd84d
@@ -9,47 +9,33 @@ divider = #ffd84d
 row_selected = #375a7f
 
 [main_window]
-width = 1286
-height = 887
-x = 
-y = 
-maximized = false
-remember_position = true
-remember_size = true
-font_name = 
-font_size = 
-background = 
-foreground = 
+width = 936
+height = 1035
+center_on_start = true
+last_x = -1
+last_y = -1
 
 [star_window]
-width = 1098
-height = 748
-x = 
-y = 
-maximized = false
+width = 1095
+height = 724
 ratio_top = 0.60
 ratio_plot = 0.62
 ratio_bottom_left = 0.50
-remember_position = true
-remember_size = true
-font_name = 
-font_size = 
-background = 
-foreground = 
+last_x = 0
+last_y = 0
+
+[finding_chart]
+width = 760
+height = 760
+radius_arcmin = 6.0
+
+[main_columns]
+id = 105
+mag = 150
+ra = 164
+dec = 240
 
 [find_chart]
 width = 808
 height = 809
-x = 
-y = 
-maximized = false
-remember_position = true
-remember_size = true
-font_name = 
-font_size = 
-background = 
-foreground = 
-radius_arcmin = 6.0
-recenter_one_sided_cloud = true
-font_family = DejaVu Sans
 
