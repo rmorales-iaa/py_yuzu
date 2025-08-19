@@ -64,6 +64,13 @@ from util.log import func_catchall
 # Map string type names (optparse style) to callables (argparse style)
 _TYPE_MAP = {"str": str, "int": int, "float": float, "complex": complex}
 
+def iraf_safe_path(p) -> str:
+    """Normalize to an IRAF-safe filename: absolute, POSIX, no '//'."""
+    s = Path(p).resolve().as_posix()
+    while '//' in s:
+        s = s.replace('//', '/')
+    return s
+
 def _sanitize_help_text(text: str) -> str:
     if not isinstance(text, str):
         return text
@@ -414,9 +421,10 @@ def main(arguments: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
-    sources_img_path = options.paths[0]
-    input_paths = set(options.paths[1:-1])
-    output_db_path = options.paths[-1]
+    # --- SANITIZE ALL PATHS EARLY (IRAF-safe) ---
+    sources_img_path = iraf_safe_path(options.paths[0])
+    input_paths = set(iraf_safe_path(p) for p in options.paths[1:-1])
+    output_db_path = iraf_safe_path(options.paths[-1])
     assert input_paths
 
     # Normalize --uncimgk empty => None
@@ -514,11 +522,13 @@ def main(arguments: list[str] | None = None) -> int:
 
     show_progress(0.0)
     for index, img_path in enumerate(input_paths):
-        img = fitsimage.FITSImage(img_path)
+        # Ensure every FITSImage is built from an IRAF-safe path
+        safe_path = iraf_safe_path(img_path)
+        img = fitsimage.FITSImage(safe_path)
         pfilter = img.pfilter(options.filterk)
-        files[pfilter].append(img_path)
+        files[pfilter].append(safe_path)  # store sanitized paths
         date = get_date(img)
-        img_dates[img_path] = date
+        img_dates[safe_path] = date
         show_progress((index + 1) / float(len(input_paths)) * 100.0)
     print()  # newline
 
@@ -628,7 +638,7 @@ def main(arguments: list[str] | None = None) -> int:
     print(f"{style.prefix}Running SExtractor on the sources image...", end="")
     sys.stdout.flush()
 
-    # Work on a temporary copy of the sources image
+    # Work on a temporary copy of the sources image (tmp path is safe)
     basename = Path(sources_img_path).name
     root, extension = os.path.splitext(basename)
     tmp_fd, tmp_sources_img_path = tempfile.mkstemp(prefix=f"{root}_", suffix=extension)
@@ -795,7 +805,7 @@ def main(arguments: list[str] | None = None) -> int:
         print("done.")
 
         # Store sources image info
-        path = sources_img.path
+        path = sources_img.path  # temp copy path (kept to preserve original behavior)
         pfilter = func_catchall(sources_img.pfilter, options.filterk)
         kwargs = dict(date_keyword=options.datek, time_keyword=options.timek, exp_keyword=options.exptimek)
         unix_time = func_catchall(sources_img.date, **kwargs)
@@ -896,7 +906,9 @@ def main(arguments: list[str] | None = None) -> int:
 
             def map_async_args():
                 for path_ in images:
-                    img_ = fitsimage.FITSImage(path_)
+                    # Rebuild FITSImage from the already-sanitized path
+                    safe_path = iraf_safe_path(path_)
+                    img_ = fitsimage.FITSImage(safe_path)
                     yield (img_, qphot_params(img_), options)
 
             result = pool.map_async(parallel_photometry, map_async_args())
