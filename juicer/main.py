@@ -79,6 +79,11 @@ def run_app(db_path: Optional[str] = None,
     """
     Preferred entry point. Tries to call juicer.app.run_app(...).
     If unavailable, constructs LEMONJuicerApp directly.
+
+    Returns:
+        0   on normal exit,
+        130 on Ctrl+C / SIGINT,
+        2   on startup/runtime errors.
     """
     # Ensure the window will receive autoselect coords even on older apps
     _monkeypatch_window_autoselect(start_radec)
@@ -100,7 +105,7 @@ def run_app(db_path: Optional[str] = None,
     # If app provides a run_app, prefer that (try modern signature first)
     if hasattr(app_mod, "run_app"):
         try:
-            return int(app_mod.run_app(db_path=chosen, argv=None, start_radec=start_radec))  # type: ignore[arg-type]
+            return int(app_mod.run_app(db_path=chosen, argv=None, start_radec=start_radec) or 0)  # type: ignore[arg-type]
         except TypeError:
             # Fall back through a few older signatures
             for sig in (
@@ -109,11 +114,17 @@ def run_app(db_path: Optional[str] = None,
                 dict(),
             ):
                 try:
-                    return int(app_mod.run_app(**sig))  # type: ignore[misc]
+                    return int(app_mod.run_app(**sig) or 0)  # type: ignore[misc]
                 except TypeError:
                     continue
-            logger.error("juicer.app.run_app exists but no compatible signature matched.")
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:
+            logger.error("juicer.app.run_app crashed: %s", e)
             return 2
+
+        logger.error("juicer.app.run_app exists but no compatible signature matched.")
+        return 2
 
     # Otherwise, try to build and run the application directly
     App: Any = getattr(app_mod, "LEMONJuicerApp", None)
@@ -127,7 +138,12 @@ def run_app(db_path: Optional[str] = None,
         except TypeError:
             app = App(db_path=chosen)  # type: ignore[call-arg]
             # window gets patched to hold _autoselect_radec by _monkeypatch_window_autoselect
-        return int(app.run(list(argv) if argv is not None else None))
+
+        try:
+            return int(app.run(list(argv) if argv is not None else None) or 0)
+        except KeyboardInterrupt:
+            return 130
+
     except Exception as e:
         logger.error("Failed to start LEMONJuicerApp: %s", e)
         return 2

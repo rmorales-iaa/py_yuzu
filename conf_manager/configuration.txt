@@ -6,7 +6,7 @@ foreground = #e7ebef
 accent = #ffd84d
 blue = #0d6efd
 divider = #ffd84d
-row_selected = #375a7f
+row_selected = #004D40 
 
 [main_window]
 width = 936
@@ -36,6 +36,6 @@ ra = 164
 dec = 240
 
 [find_chart]
-width = 808
-height = 809
+width = 864
+height = 867
 
