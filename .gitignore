@@ -1,2 +1,4 @@
 test/output/*
 test/small_sample/*
+__pycache__/*
+__pycache__/*
