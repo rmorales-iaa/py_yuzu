@@ -1,6 +1,4 @@
-# juicer/window.py
 from __future__ import annotations
-
 import importlib
 import importlib.util
 import logging
@@ -16,9 +14,10 @@ gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GObject", "2.0")
-from gi.repository import Gtk, Gio, GLib, Gdk, GObject, Pango  # type: ignore
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gtk, Gio, GLib, Gdk, GObject, Pango, Graphene  # type: ignore
 
-# Try to access the shared configuration (rebound in main via --config)
+# Optional config (rebound via --config)
 try:
     from conf_manager.conf_manager import cfg  # type: ignore
 except Exception:
@@ -34,12 +33,12 @@ for p in (str(PKG_DIR), str(ROOT_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# Your models + star details window
-from .models import StarRow  # GObject props: id (int), ra (float), dec (float), imag (float|None)
+# Models + details window
+from .models import StarRow
 from .star_window import StarDetailsWindow
 
 
-# ---------- Config helpers ----------
+# ---------------- Config helpers ----------------
 def _cfg_get(section: str, key: str, default: str) -> str:
     try:
         return cfg.get(section, key) if cfg else default
@@ -52,17 +51,9 @@ def _cfg_get_int(section: str, key: str, default: int) -> int:
     except Exception:
         return default
 
-def _cfg_true(section: str, key: str, default: bool) -> bool:
-    try:
-        v = (cfg.get(section, key) if cfg else "").strip().lower()
-        return v in ("1", "true", "yes", "on") if v else default
-    except Exception:
-        return default
 
-
-# ---------- Helpers ----------
+# ---------------- Import miner ----------------
 def _import_miner_class() -> Type:
-    """Best-effort import of LEMONdBMiner (package/absolute/by-path)."""
     last_exc: Exception | None = None
     try:
         from .mining import LEMONdBMiner  # type: ignore
@@ -78,7 +69,7 @@ def _import_miner_class() -> Type:
     if candidate.exists():
         spec = importlib.util.spec_from_file_location("juicer.mining", candidate)
         if spec and spec.loader:
-            mod = importlib.module_from_spec(spec)
+            mod = importlib.util.module_from_spec(spec)
             sys.modules["juicer.mining"] = mod
             spec.loader.exec_module(mod)  # type: ignore[attr-defined]
             if hasattr(mod, "LEMONdBMiner"):
@@ -89,129 +80,96 @@ def _import_miner_class() -> Type:
         f"Last import error: {last_exc}"
     )
 
+
+# ---------------- Sexagesimal formatters ----------------
 def _hms_from_deg(ra_deg: float) -> str:
     ra = (ra_deg / 15.0) % 24.0
-    h = int(ra)
-    m = int((ra - h) * 60.0)
+    h = int(ra); m = int((ra - h) * 60.0)
     s = (ra - h - m / 60.0) * 3600.0
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 def _dms_from_deg(dec_deg: float) -> str:
     sign = "-" if dec_deg < 0 else "+"
     dabs = abs(dec_deg)
-    d = int(dabs)
-    m = int((dabs - d) * 60.0)
+    d = int(dabs); m = int((dabs - d) * 60.0)
     s = (dabs - d - m / 60.0) * 3600.0
     return f"{sign}{d:02d}:{m:02d}:{s:05.2f}"
 
 
-# ---------- Main Window ----------
+# ---------------- Main Window ----------------
 class LEMONJuicerWindow(Gtk.ApplicationWindow):
     """GTK4 window with a ColumnView listing stars from the DB."""
 
     def __init__(self, app: Gtk.Application, title_suffix: str = "",
                  autoselect_radec: Optional[tuple[float, float]] = None):
-        # Geometry from config (optional)
+        # Geometry from config
         width  = _cfg_get_int("main_window", "width", 1200)
         height = _cfg_get_int("main_window", "height", 800)
         super().__init__(application=app, title=f"LEMON Juicer{title_suffix}")
         self.set_default_size(width, height)
 
-        # One-shot autoselection request (may be injected by monkeypatch)
+        # One-shot autoselection (degrees)
         self._autoselect_radec: Optional[tuple[float, float]] = getattr(
             self, "_autoselect_radec", autoselect_radec
         )
         self._autoselect_done: bool = False
 
-        self._last_opened_star_id: Optional[int] = None
         self._star_win: Optional[Gtk.Window] = None
 
-        # ---- Palette & font (from [theme]) ----
+        # Selection memory + reveal scheduling
+        self._selected_star_id: Optional[int] = None
+        self._reselect_idle_id: Optional[int] = None
+        self._reselect_guard_id: Optional[int] = None
+        self._reveal_retry_ids: list[int] = []
+
+        # Scrolling helpers
+        self._row_height_px: Optional[int] = None
+        self._scroller: Optional[Gtk.ScrolledWindow] = None
+        self._row_widgets: dict[int, Gtk.Widget] = {}     # sorted index -> row widget (box)
+        self._inner_listview: Optional[Gtk.ListView] = None
+
+        # ---- Theme from [theme] ----
         _FONT_NAME   = _cfg_get("theme", "font_name", "Cantarell")
         _FONT_SIZEPT = _cfg_get_int("theme", "font_size", 11)
+        _BG          = _cfg_get("theme", "background", "#2a2f38")
+        _FG          = _cfg_get("theme", "foreground", "#e7ebef")
+        _ACCENT      = _cfg_get("theme", "accent",    "#ffd84d")
+        _DIVIDER     = _cfg_get("theme", "divider",   "#ffd84d")
+        _DIV_W       = _cfg_get_int("theme", "divider_width_px", 1)
+        _SEL_BG      = _cfg_get("theme", "row_selected", "#375a7f")
+        _SEL_FG      = _ACCENT
 
-        _DARK_LIGHT_BG = _cfg_get("theme", "background", "#2a2f38")
-        _FG_COLOR      = _cfg_get("theme", "foreground", "#e7ebef")
-        _ACCENT        = _cfg_get("theme", "accent",    "#ffd84d")
-        _DIVIDER       = _cfg_get("theme", "divider",   "#ffd84d")
-        _DIVIDER_W     = _cfg_get_int("theme", "divider_width_px", 1)
-
-        # You can set this to green in config:
-        #   row_selected = #1fa64a
-        _SELECT_BG     = _cfg_get("theme", "row_selected", "#375a7f")
-        _SELECT_FG     = _ACCENT
-
-        # Column header palette (hardcoded defaults; add to config if desired)
         _HEADER_BG        = "#1f4aa8"
         _HEADER_BG_HOVER  = "#2456bf"
         _HEADER_BG_ACTIVE = "#1a3e8f"
 
         # ---------- CSS ----------
         provider = Gtk.CssProvider()
-        # NOTE: doubled braces {{ }} because this string is an f-string
         css = f"""
-        /* App font from config */
         * {{
           font-family: '{_FONT_NAME}';
           font-size: {_FONT_SIZEPT}pt;
         }}
+        columnview.lemon-dark listview {{ background-color: {_BG}; }}
+        columnview.lemon-dark label {{ color: {_FG}; }}
 
-        /* Base colors from config */
-        columnview.lemon-dark listview {{
-          background-color: {_DARK_LIGHT_BG};
-        }}
-        columnview.lemon-dark label {{
-          color: {_FG_COLOR};
-        }}
-
-        /* Selected row — override theme (row & listitem, focused/unfocused/backdrop) */
+        /* Strong selection override */
         columnview.lemon-dark listview row:selected,
         columnview.lemon-dark listview row:selected:focus,
-        columnview.lemon-dark listview row:selected:backdrop,
         columnview.lemon-dark listitem:selected,
-        columnview.lemon-dark listitem:selected:focus,
-        columnview.lemon-dark listitem:selected:backdrop {{
-          background-color: {_SELECT_BG};
+        columnview.lemon-dark listitem:selected:focus {{
+          background-color: {_SEL_BG};
         }}
         columnview.lemon-dark listview row:selected label,
-        columnview.lemon-dark listview row:selected:focus label,
-        columnview.lemon-dark listview row:selected:backdrop label,
-        columnview.lemon-dark listitem:selected label,
-        columnview.lemon-dark listitem:selected:focus label,
-        columnview.lemon-dark listitem:selected:backdrop label {{
-          color: {_SELECT_FG};
+        columnview.lemon-dark listitem:selected label {{
+          color: {_SEL_FG};
         }}
 
-        /* Per-cell column divider: 1px box (color here, width set in code) */
-        .lemon-vsep {{
-          background-color: {_DIVIDER};
-          margin-left: 6px;
-        }}
-        .lemon-last .lemon-vsep {{
-          background-color: transparent;
-          margin-left: 0;
-        }}
+        /* Per-cell column divider */
+        .lemon-vsep {{ background-color: {_DIVIDER}; margin-left: 6px; }}
+        .lemon-last .lemon-vsep {{ background-color: transparent; margin-left: 0; }}
 
-        /* Header dividers */
-        columnview.lemon-dark > header button {{
-          border-right: 1px solid {_DIVIDER};
-          border-top: 0;
-          border-bottom: 0;
-        }}
-        columnview.lemon-dark > header button:last-child {{
-          border-right: none;
-        }}
-
-        /* Status bar */
-        .lemon-statusbar {{
-          background-color: {_DARK_LIGHT_BG};
-          padding: 6px 10px;
-        }}
-        .lemon-statusbar * {{
-          color: {_ACCENT};
-        }}
-
-        /* Column headers (blue) */
+        /* Header */
         columnview.lemon-dark > header,
         columnview.lemon-dark > header > * {{
           background-color: {_HEADER_BG};
@@ -222,20 +180,20 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
           color: #ffffff;
           font-weight: 600;
           padding: 6px 8px;
+          border-right: 1px solid {_DIVIDER};
+          border-top: 0;
+          border-bottom: 0;
         }}
-        columnview.lemon-dark > header button:hover {{
-          background-color: {_HEADER_BG_HOVER};
-        }}
+        columnview.lemon-dark > header button:last-child {{ border-right: none; }}
+        columnview.lemon-dark > header button:hover {{ background-color: {_HEADER_BG_HOVER}; }}
         columnview.lemon-dark > header button:active,
-        columnview.lemon-dark > header button:checked {{
-          background-color: {_HEADER_BG_ACTIVE};
-        }}
-        columnview.lemon-dark > header button image {{
-          color: #ffffff;
-        }}
+        columnview.lemon-dark > header button:checked {{ background-color: {_HEADER_BG_ACTIVE}; }}
+
+        /* Status bar */
+        .lemon-statusbar {{ background-color: {_BG}; padding: 6px 10px; }}
+        .lemon-statusbar * {{ color: {_ACCENT}; }}
         """
         provider.load_from_data(css.encode("utf-8"))
-        # USER priority so our selection color beats the theme’s
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(),
             provider,
@@ -250,22 +208,49 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         open_btn.connect("clicked", self._on_open_clicked)
         hb.pack_start(open_btn)
 
-        # ---------- Root layout ----------
+        # ---------- Root ----------
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        root.set_hexpand(True)
-        root.set_vexpand(True)
+        root.set_hexpand(True); root.set_vexpand(True)
         self.set_child(root)
 
-        # ---------- Model pipeline: rows -> sort -> selection ----------
+        # ---------- Models ----------
         self._rows = Gio.ListStore.new(StarRow)
         self._sort_model = Gtk.SortListModel.new(model=self._rows, sorter=None)
         self._sel = Gtk.SingleSelection.new(self._sort_model)
-        self._sel.set_autoselect(False)
-        self._sel.set_can_unselect(False)  # keep selection when set programmatically
+        try:
+            self._sel.set_autoselect(True)
+        except Exception:
+            pass
+        self._sel.set_can_unselect(False)
         self._sel.connect("selection-changed", self._on_selection_changed)
 
-        # ---------- Column factory ----------
-        # read width hints from config (optional)
+        # ---------- ColumnView ----------
+        self._view = Gtk.ColumnView.new(self._sel)
+        self._view.add_css_class("lemon-dark")
+        self._view.set_hexpand(True); self._view.set_vexpand(True)
+        self._view.connect("activate", self._on_view_activate)  # double-click / Enter opens
+
+        # When the view is mapped or size changes, retry reveal the *current* selection
+        self._view.connect("map", lambda *_: GLib.idle_add(self._reveal_current_selection))
+        try:
+            self._view.connect("size-allocate", lambda *_a: GLib.idle_add(self._reveal_current_selection))
+        except Exception:
+            pass
+
+        # Re-select remembered ID if sort changes
+        self._sort_model.connect("items-changed", lambda *_: self._request_reselect())
+        try:
+            sorter = self._view.get_sorter()
+            if sorter is not None:
+                sorter.connect("changed", lambda *_: self._request_reselect())
+        except Exception:
+            pass
+        try:
+            self._view.connect("notify::sorter", lambda *_: self._request_reselect())
+        except Exception:
+            pass
+
+        # ---------- Column widths ----------
         _W_ID  = _cfg_get_int("main_columns", "id", 105)
         _W_RA  = _cfg_get_int("main_columns", "ra", 164)
         _W_DEC = _cfg_get_int("main_columns", "dec", 240)
@@ -276,24 +261,12 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                              xalign: float, monospace: bool = True,
                              expand: bool = False,
                              is_last: bool = False) -> Gtk.ColumnViewColumn:
-            """
-            get_text(row: StarRow) -> str
-
-            Structure per cell:
-                HBox(.lemon-cell[.lemon-last])
-                  - Gtk.Label   (text)
-                  - Gtk.Box(.lemon-vsep)  [1px yellow vertical line; hidden on last col]
-            """
             factory = Gtk.SignalListItemFactory()
 
             def setup(_f, li: Gtk.ListItem):
-                # cell box
                 box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-                box.add_css_class("lemon-cell")
                 if is_last:
                     box.add_css_class("lemon-last")
-
-                # label
                 lbl = Gtk.Label(xalign=xalign)
                 lbl.set_single_line_mode(True)
                 lbl.set_ellipsize(Pango.EllipsizeMode.END)
@@ -301,17 +274,13 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                     lbl.add_css_class("monospace")
                 lbl.set_hexpand(True)
                 box.append(lbl)
-
-                # vertical 1px line (acts as column divider)
                 sep = Gtk.Box()
                 sep.add_css_class("lemon-vsep")
-                sep.set_hexpand(False)
-                sep.set_vexpand(True)
-                sep.set_size_request(max(1, _DIVIDER_W), -1)
+                sep.set_hexpand(False); sep.set_vexpand(True)
+                sep.set_size_request(max(1, _DIV_W), -1)
                 if is_last:
                     sep.set_visible(False)
                 box.append(sep)
-
                 li.set_child(box)
 
             def bind(_f, li: Gtk.ListItem):
@@ -322,8 +291,35 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 if isinstance(lbl, Gtk.Label):
                     lbl.set_text(txt)
 
+                # Track row widget for bounds-based scrolling
+                try:
+                    pos = li.get_position()
+                    if isinstance(pos, int) and pos >= 0:
+                        self._row_widgets[pos] = box
+                except Exception:
+                    pass
+
+                # Measure row height once
+                try:
+                    alloc = box.get_allocation()
+                    h = getattr(alloc, "height", 0) or 0
+                    if h > 0 and getattr(self, "_row_height_px", None) is None:
+                        self._row_height_px = int(h)
+                except Exception:
+                    pass
+
+            def unbind(_f, li: Gtk.ListItem):
+                try:
+                    box = li.get_child()
+                    for k, v in list(self._row_widgets.items()):
+                        if v is box:
+                            self._row_widgets.pop(k, None)
+                except Exception:
+                    pass
+
             factory.connect("setup", setup)
             factory.connect("bind", bind)
+            factory.connect("unbind", unbind)
 
             col = Gtk.ColumnViewColumn(title=title, factory=factory)
             col.set_resizable(True)
@@ -332,16 +328,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 col.set_fixed_width(width_px)
             return col
 
-        # ---------- ColumnView ----------
-        self._view = Gtk.ColumnView.new(self._sel)
-        self._view.add_css_class("lemon-dark")
-        self._view.set_hexpand(True)
-        self._view.set_vexpand(True)
-
-        # Open details only on double-click (activate) or Enter
-        self._view.connect("activate", self._on_view_activate)
-
-        # --- Define columns ---
+        # ---------- Columns ----------
         col_id = make_text_column(
             "ID",
             lambda r: "" if r is None else f"{int(getattr(r.props, 'id', 0))}",
@@ -365,17 +352,17 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             lambda r: "" if r is None else (
                 "" if (getattr(r.props, "imag", float("nan")) is None
                        or (isinstance(getattr(r.props, "imag", None), float)
-                           and math.isnan(float(getattr(r.props, "imag", float("nan"))))))
+                           and math.isnan(float(getattr(r.props, "imag", float('nan'))))))
                 else f"{float(getattr(r.props, 'imag', float('nan'))):.3f}"
             ),
-            width_px=_W_MAG, xalign=1.0, monospace=True, expand=False, is_last=True,  # last column → no trailing divider
+            width_px=_W_MAG, xalign=1.0, monospace=True, expand=False, is_last=True,
         ); self._view.append_column(col_mag)
 
         # ---------- Sorters ----------
         def numeric_sorter(prop_name: str) -> Gtk.NumericSorter:
             expr = Gtk.PropertyExpression.new(StarRow, None, prop_name)
             s = Gtk.NumericSorter.new(expr)
-            s.set_sort_order(Gtk.SortType.ASCENDING)  # header toggles asc/desc
+            s.set_sort_order(Gtk.SortType.ASCENDING)
             return s
 
         def multi(primary: str, secondary: str) -> Gtk.MultiSorter:
@@ -390,33 +377,32 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         col_id.set_sorter(multi("id", "ra"))
 
         self._sort_model.set_sorter(self._view.get_sorter())
-        self._view.sort_by_column(col_ra, Gtk.SortType.DESCENDING)
 
         # ---------- Scroller ----------
         scroller = Gtk.ScrolledWindow.new()
         scroller.add_css_class("lemon-scroller")
         scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroller.set_child(self._view)
-        scroller.set_hexpand(True)
-        scroller.set_vexpand(True)
+        scroller.set_hexpand(True); scroller.set_vexpand(True)
         root.append(scroller)
+        self._scroller = scroller
 
-        # ---------- Status bar ----------
+        # ---------- Status ----------
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         status_bar.add_css_class("lemon-statusbar")
         status_bar.set_hexpand(True)
         self._status = Gtk.Label(label="Open a .LEMONdB to begin.")
         self._status.set_halign(Gtk.Align.START)
         self._status.set_selectable(True)
-        self._install_status_context_menu()  # dark, Copy / Select All only
+        self._install_status_context_menu()
         status_bar.append(self._status)
         root.append(status_bar)
 
-        # ---------- Data holders ----------
+        # Data holders
         self._miner = None
         self._db_path: Optional[str] = None
 
-    # ---- UI helpers ----
+    # -------- UI helpers --------
     def _set_status(self, text: str) -> None:
         self._status.set_label(text)
 
@@ -436,18 +422,47 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    # ---- Selection & activate handlers ----
+    # -------- Selection & activate --------
+    def _cancel_reveal_retries(self) -> None:
+        if not self._reveal_retry_ids:
+            return
+        for sid in self._reveal_retry_ids:
+            try:
+                GLib.source_remove(sid)
+            except Exception:
+                pass
+        self._reveal_retry_ids.clear()
+
+    def _queue_reveal_retries(self) -> None:
+        """Schedule a few retries that always recompute the CURRENT selection."""
+        self._cancel_reveal_retries()
+        self._reveal_retry_ids.append(GLib.idle_add(self._reveal_current_selection))
+        for delay in (80, 180, 360, 700, 1200):
+            self._reveal_retry_ids.append(GLib.timeout_add(delay, self._reveal_current_selection))
+        try:
+            def _tick_once(_w, _fc):
+                self._reveal_current_selection()
+                return False
+            self._view.add_tick_callback(_tick_once)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     def _on_selection_changed(self, _model, _pos, _n_items):
         item: StarRow | None = self._sel.get_selected_item()
         if not item:
             self._status.set_label("No star selected.")
+            self._cancel_reveal_retries()
             return
         sid = int(getattr(item.props, "id", -1))
+        self._selected_star_id = sid
         ra  = float(getattr(item.props, "ra", 0.0))
         dec = float(getattr(item.props, "dec", 0.0))
         imag = getattr(item.props, "imag", float("nan"))
         mag_txt = "" if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else f"{float(imag):.3f}"
         self._status.set_label(f"ID: {sid}  |  RA: {_hms_from_deg(ra)}  |  Dec: {_dms_from_deg(dec)}  |  Mag: {mag_txt}")
+
+        # Reveal *this* selection and only schedule retries that recompute the current pos
+        self._queue_reveal_retries()
 
     def _on_view_activate(self, _view: Gtk.ColumnView, _pos: int):
         item: StarRow | None = self._sel.get_selected_item()
@@ -457,10 +472,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
     def _open_star_window(self, row: StarRow) -> None:
         try:
             if self._star_win is not None:
-                try:
-                    self._star_win.destroy()
-                except Exception:
-                    pass
+                try: self._star_win.destroy()
+                except Exception: pass
                 self._star_win = None
         except Exception:
             self._star_win = None
@@ -470,16 +483,15 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         except Exception as e:
             self._show_error(f"Could not open star window:\n{e}", title="Star Window Error")
 
-    # ---- Open handlers ----
+    # -------- File open --------
     def _on_open_clicked(self, _btn: Gtk.Button) -> None:
         self._show_open_dialog()
 
     def _show_open_dialog(self) -> None:
         dlg = Gtk.FileDialog.new()
-        pattern = "*.LEMONdB"
         filt = Gtk.FileFilter()
-        filt.set_name(f"LEMON Database ({pattern})")
-        filt.add_pattern(pattern)
+        filt.set_name("LEMON Database (*.LEMONdB)")
+        filt.add_pattern("*.LEMONdB")
         dlg.set_default_filter(filt)
 
         def _on_done(_src, res):
@@ -495,7 +507,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         dlg.open(self, None, _on_done)
 
-    # ---- DB ops ----
+    # -------- DB ops --------
     def open_db(self, path: str) -> None:
         p = Path(path) if path else None
         try:
@@ -514,12 +526,11 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"yuzu juicer — {Path(db_path).name}")
+        self.set_title(f"LEMON juicer — {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
-
         self._populate_overview_from_miner(miner)
 
-    # ---- Auto-select helpers ----
+    # -------- Auto-select / reveal --------
     def _angsep_deg(self, ra1, dec1, ra2, dec2) -> float:
         r1 = math.radians(ra1); d1 = math.radians(dec1)
         r2 = math.radians(ra2); d2 = math.radians(dec2)
@@ -527,57 +538,187 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         cos_d = max(-1.0, min(1.0, cos_d))
         return math.degrees(math.acos(cos_d))
 
+    def _find_inner_listview(self) -> Optional[Gtk.ListView]:
+        if self._inner_listview:
+            return self._inner_listview
+        try:
+            def walk(w: Gtk.Widget):
+                c = w.get_first_child()
+                while c:
+                    if isinstance(c, Gtk.ListView):
+                        return c
+                    r = walk(c)
+                    if r:
+                        return r
+                    c = c.get_next_sibling()
+                return None
+            lv = walk(self._view)
+            if isinstance(lv, Gtk.ListView):
+                self._inner_listview = lv
+                return lv
+        except Exception:
+            pass
+        return None
+
+    def _scroll_to_widget_bounds(self, widget: Gtk.Widget) -> bool:
+        try:
+            if not self._scroller:
+                return False
+            rect = widget.compute_bounds(self._scroller)
+            if not isinstance(rect, Graphene.Rect):
+                return False
+            vadj = self._scroller.get_vadjustment()
+            if not vadj:
+                return False
+            page = vadj.get_page_size()
+            upper = vadj.get_upper()
+            if page <= 0 or upper <= 0:
+                return False
+            target_y = max(0.0, rect.y - 0.3 * page)
+            target_y = min(target_y, max(0.0, upper - page))
+            if abs(vadj.get_value() - target_y) > 1.0:
+                vadj.set_value(target_y)
+            try: self._view.grab_focus()
+            except Exception: pass
+            return True
+        except Exception:
+            return False
+
+    def _reveal_current_selection(self) -> bool:
+        """Reveal the currently selected row, if any (recomputes index each time)."""
+        try:
+            pos = None
+            try:
+                pos = int(self._sel.get_selected())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if pos is None or pos < 0:
+                it = self._sel.get_selected_item()
+                if it is None:
+                    return False
+                sid = int(getattr(it.props, "id", -1))
+                m = self._sort_model.get_n_items()
+                for j in range(m):
+                    it2 = self._sort_model.get_item(j)
+                    try:
+                        if int(getattr(it2.props, "id", -2)) == sid:
+                            pos = j
+                            break
+                    except Exception:
+                        continue
+            if pos is None or pos < 0:
+                return False
+            self._reveal_sorted_position(pos)
+        except Exception:
+            pass
+        return False
+
+    def _reveal_sorted_position(self, pos: int) -> None:
+        """Bring row at `pos` into view — immediate attempts only."""
+        # A) ColumnView API
+        try:
+            self._view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, None)  # type: ignore[attr-defined]
+            try: self._view.grab_focus()
+            except Exception: pass
+            return
+        except Exception:
+            pass
+        # B) ColumnView action
+        try:
+            self._view.activate_action("list.scroll-to-item", GLib.Variant('u', pos))
+            try: self._view.grab_focus()
+            except Exception: pass
+            return
+        except Exception:
+            pass
+        # C) Inner ListView action
+        try:
+            lv = self._find_inner_listview()
+            if lv is not None:
+                lv.activate_action("list.scroll-to-item", GLib.Variant('u', pos))
+                try: self._view.grab_focus()
+                except Exception: pass
+                return
+        except Exception:
+            pass
+        # D) Widget bounds
+        try:
+            w = self._row_widgets.get(pos)
+            if w is not None and self._scroll_to_widget_bounds(w):
+                return
+        except Exception:
+            pass
+        # E) Adjustment estimate
+        try:
+            if self._scroller:
+                vadj = self._scroller.get_vadjustment()
+                if vadj:
+                    row_h = self._row_height_px or 30
+                    page = vadj.get_page_size()
+                    upper = vadj.get_upper()
+                    if row_h > 0 and page > 0 and upper > 0:
+                        target_y = max(0.0, pos * float(row_h) - 0.3 * page)
+                        target_y = min(target_y, max(0.0, upper - page))
+                        if abs(vadj.get_value() - target_y) > 1.0:
+                            vadj.set_value(target_y)
+                        try: self._view.grab_focus()
+                        except Exception: pass
+        except Exception:
+            pass
+
     def _select_nearest_to(self, ra_deg: float, dec_deg: float) -> None:
-        # Find closest in the BASE store by angular separation
-        best_i = -1
-        best_sep = float("inf")
-        best_id = None
+        best_i = -1; best_sep = float("inf"); best_id = None
         n = self._rows.get_n_items()
         for i in range(n):
             row = self._rows.get_item(i)
             try:
                 r = float(getattr(row.props, "ra", float("nan")))
                 d = float(getattr(row.props, "dec", float("nan")))
-                if math.isnan(r) or math.isnan(d):
-                    continue
+                if math.isnan(r) or math.isnan(d): continue
                 sep = self._angsep_deg(ra_deg, dec_deg, r, d)
                 if sep < best_sep:
-                    best_sep, best_i = sep, i
-                    best_id = int(getattr(row.props, "id", -1))
+                    best_sep, best_i, best_id = sep, i, int(getattr(row.props, "id", -1))
             except Exception:
                 continue
-
         if best_i < 0 or best_id is None:
             logger.info("Auto-select: no candidates found.")
             return
 
-        # Map by STAR ID into the SORTED model
+        # Map ID to sorted index
         m = self._sort_model.get_n_items()
-        target_sorted_index = -1
-        target_row = None
+        target_idx = -1; target_row = None
         for j in range(m):
             it = self._sort_model.get_item(j)
             try:
                 if int(getattr(it.props, "id", -2)) == best_id:
-                    target_sorted_index = j
-                    target_row = it
+                    target_idx, target_row = j, it
                     break
             except Exception:
                 continue
-
-        if target_sorted_index < 0 or target_row is None:
+        if target_idx < 0 or target_row is None:
             logger.warning("Auto-select: could not map base index to sorted model.")
             return
 
-        # Apply selection and make it visible (no auto-open)
-        self._sel.set_selected(target_sorted_index)
+        # Select
+        ok = False
         try:
-            self._view.grab_focus()
+            ok = bool(self._sel.select_item(target_idx, True))  # type: ignore[attr-defined]
         except Exception:
             pass
-        self._reveal_sorted_position(target_sorted_index)  # ← robust, multi-shot scroll
+        if not ok:
+            try:
+                self._sel.set_selected(target_idx)
+                ok = True
+            except Exception:
+                ok = False
+        if not ok:
+            logger.warning("Auto-select: selection call did not apply.")
+            return
 
-        # Log which one we picked
+        self._selected_star_id = best_id
+        self._queue_reveal_retries()
+
+        # Log picked star
         r = float(getattr(target_row.props, "ra", float("nan")))
         d = float(getattr(target_row.props, "dec", float("nan")))
         sep = self._angsep_deg(ra_deg, dec_deg, r, d)
@@ -585,21 +726,37 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                     int(getattr(target_row.props, "id", -1)),
                     _hms_from_deg(r), _dms_from_deg(d), sep * 60.0)
 
+        # One quick reassert if a resort immediately moved it
+        def _reassert(*_a):
+            it = self._sel.get_selected_item()
+            if not it or int(getattr(it.props, "id", -999)) != best_id:
+                try:
+                    self._sel.set_selected(target_idx)
+                    self._queue_reveal_retries()
+                    logger.info("Auto-select reasserted at %s", target_idx)
+                except Exception:
+                    pass
+            return False
+        GLib.idle_add(_reassert)
+
     def _do_autoselect_now(self) -> bool:
         if self._autoselect_done or not self._autoselect_radec:
             return False
         ra0, dec0 = self._autoselect_radec
+        try:
+            logger.info("Auto-select request: RA=%.6f deg  Dec=%.6f deg", ra0, dec0)
+        except Exception:
+            pass
         try:
             self._select_nearest_to(float(ra0), float(dec0))
         except Exception as e:
             logger.warning("Auto-select failed: %s", e)
         finally:
             self._autoselect_done = True
-            self._autoselect_radec = None  # one-shot
+            self._autoselect_radec = None
         return False
 
     def _ensure_autoselect_when_ready(self) -> None:
-        """Run autoselect once the SortListModel has items (after populate)."""
         if self._autoselect_done or not self._autoselect_radec:
             return
         if self._sort_model.get_n_items() > 0:
@@ -608,12 +765,73 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         def on_items_changed(model, pos, removed, added):
             if model.get_n_items() > 0 and not self._autoselect_done:
                 GLib.idle_add(self._do_autoselect_now)
-            model.disconnect(handler_id)
+            try:
+                model.disconnect(handler_id)
+            except Exception:
+                pass
         handler_id = self._sort_model.connect("items-changed", on_items_changed)
 
-    # ---- Status context menu (dark, copy-only) ----
+    # -------- Debounced reselect by remembered ID --------
+    def _request_reselect(self) -> None:
+        if self._reselect_idle_id is not None:
+            return
+        self._reselect_idle_id = GLib.idle_add(self._do_reselect_once)
+
+    def _do_reselect_once(self) -> bool:
+        try:
+            self._reselect_by_star_id()
+        finally:
+            self._reselect_idle_id = None
+        return False
+
+    def _reselect_by_star_id(self) -> None:
+        sid = self._selected_star_id
+        if sid is None:
+            return
+        if self._reselect_guard_id == sid:
+            return
+        self._reselect_guard_id = sid
+        try:
+            cur = self._sel.get_selected_item()
+            try:
+                if cur is not None and int(getattr(cur.props, "id", -999)) == sid:
+                    return
+            except Exception:
+                pass
+            m = self._sort_model.get_n_items()
+            for j in range(m):
+                it = self._sort_model.get_item(j)
+                try:
+                    if int(getattr(it.props, "id", -2)) == sid:
+                        try:
+                            if hasattr(self._sel, "select_item"):
+                                self._sel.select_item(j, True)  # type: ignore[attr-defined]
+                            else:
+                                self._sel.set_selected(j)
+                        except Exception:
+                            try:
+                                self._sel.set_selected(j)
+                            except Exception:
+                                pass
+                        try:
+                            self._view.grab_focus()
+                        except Exception:
+                            pass
+                        self._queue_reveal_retries()
+                        logger.info("Reselected remembered ID=%s at sorted index %s", sid, j)
+                        return
+                except Exception:
+                    continue
+            logger.info("Reselect: remembered ID=%s not found in current view", sid)
+        finally:
+            GLib.idle_add(self._clear_reselect_guard)
+
+    def _clear_reselect_guard(self) -> bool:
+        self._reselect_guard_id = None
+        return False
+
+    # -------- Status context menu --------
     def _ensure_lemon_css(self) -> None:
-        """Install CSS to darken the custom popover (once per display)."""
         if getattr(self, "_lemon_css_loaded", False):
             return
         css = b"""
@@ -623,24 +841,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             border-radius: 10px;
             border: 1px solid #3a3a3a;
         }
-        popover.lemon-status-pop contents,
-        popover.lemon-status-pop stack,
-        popover.lemon-status-pop box,
-        popover.lemon-status-pop viewport,
-        popover.lemon-status-pop scrolledwindow,
-        popover.lemon-status-pop listview {
-            background-color: #2f2f2f;
-        }
-        popover.lemon-status-pop modelbutton,
-        popover.lemon-status-pop modelbutton:focus,
-        popover.lemon-status-pop modelbutton:checked,
-        popover.lemon-status-pop modelbutton:active {
-            background-color: #2f2f2f;
-            color: #e6e6e6;
-        }
+        popover.lemon-status-pop * { color: #e6e6e6; }
         popover.lemon-status-pop modelbutton:hover { background-color: #3a3a3a; }
-        popover.lemon-status-pop label { color: #e6e6e6; }
-        popover.lemon-status-pop separator { background-color: #3a3a3a; }
         """
         try:
             provider = Gtk.CssProvider()
@@ -671,13 +873,10 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             pass
 
     def _install_status_context_menu(self) -> None:
-        """Replace the default label context menu with a dark, copy-only one."""
         self._ensure_lemon_css()
-
         act_copy = Gio.SimpleAction.new("status_copy", None)
         act_copy.connect("activate", self._copy_status_to_clipboard)
         self.add_action(act_copy)
-
         act_sel = Gio.SimpleAction.new("status_select_all", None)
         act_sel.connect("activate", self._select_all_status)
         self.add_action(act_sel)
@@ -716,21 +915,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         click.connect("pressed", on_pressed)
         self._status.add_controller(click)
 
-        key = Gtk.EventControllerKey()
-        key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-
-        def on_key(_ctrl, keyval, _keycode, state):
-            if keyval == Gdk.KEY_Menu or (keyval == Gdk.KEY_F10 and (state & Gdk.ModifierType.SHIFT_MASK)):
-                _popup_at(self._status.get_allocated_width() - 10, self._status.get_allocated_height() // 2)
-                return True
-            return False
-
-        key.connect("key-pressed", on_key)
-        self._status.add_controller(key)
-
-    # ---- Populate UI from miner ----
+    # -------- Populate UI --------
     def _populate_overview_from_miner(self, miner) -> None:
-        """Fill the ColumnView with star rows + update status line."""
         try:
             self._rows.remove_all()
         except Exception:
@@ -738,6 +924,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             self._sort_model.set_model(self._rows)
             self._sel.set_model(self._sort_model)
             self._view.set_model(self._sel)
+
+        self._row_widgets.clear()
 
         n_added = 0
         for star_id in getattr(miner, "star_ids", []):
@@ -769,41 +957,5 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
         self._set_status(f"Field: {field} — Stars shown: {n_added} — Filters: {n_filters}")
 
-        # Defer the nearest-star selection until the model is ready
+        # Initial autoselect (if requested)
         self._ensure_autoselect_when_ready()
-
-    def _reveal_sorted_position(self, pos: int) -> None:
-        """Ensure row at `pos` in the sorted model is scrolled into view."""
-
-        def do_scroll(*_a):
-            try:
-                # Center-ish alignment so it’s obvious
-                self._view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, 0.4)
-            except Exception:
-                try:
-                    self._view.scroll_to(pos, None)
-                except Exception:
-                    pass
-            return False  # one-shot for idle/timeouts
-
-        # Try immediately, then on idle, then shortly after, then after size-allocate.
-        do_scroll()
-        GLib.idle_add(do_scroll)
-        GLib.timeout_add(80, do_scroll)
-
-        # Also fire once after the next size allocation (when rows are realized)
-        hid = {"id": None}
-
-        def on_size_alloc(widget, _w, _h, _baseline):
-            do_scroll()
-            try:
-                if hid["id"] is not None:
-                    widget.disconnect(hid["id"])
-            except Exception:
-                pass
-            return False
-
-        try:
-            hid["id"] = self._view.connect("size-allocate", on_size_alloc)
-        except Exception:
-            pass

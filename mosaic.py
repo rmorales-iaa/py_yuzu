@@ -1,355 +1,268 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 
-from pathlib import Path
-import atexit
-import argparse
-import logging
-import multiprocessing
+# Ported to Python 3, using MontagePy, with parallelization using multiprocessing.
+
 import os
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Iterable
+import atexit
+import shutil
+import argparse
+import multiprocessing as mp
+from functools import partial
 
-from util.display import show_progress
-from util.io import clean_tmp_files
+from MontagePy.main import *
 
-# MontagePy (system package: python3-montagepy)
-from MontagePy.main import (
-    mImgtbl,
-    mMakeHdr,
-    mOverlaps,
-    mDiffFitExec,
-    mBgModel,
-    mBgExec,
-    mAdd,
-)
-# Use the fast plane-to-plane projector directly for parallelization
-try:
-    from MontagePy.main import mProjectPP as _mProject  # fast plane-to-plane
-except (ImportError, AttributeError):
-    from MontagePy.main import mProject as _mProject    # fallback to general projector
+def clean_dir(directory):
+    shutil.rmtree(directory, ignore_errors=True)
 
-# LEMON modules
-import customparser
-import defaults
-import fitsimage
-import keywords
-import style
-import util
+def read_montage_table(tbl_path):
+    """Simple parser for Montage IPAC tables."""
+    data = []
+    with open(tbl_path, 'r') as f:
+        for line in f:
+            if line.startswith('\\') or line.startswith('|'):
+                continue
+            fields = line.split()
+            data.append(fields)
+    return data
 
-logger = logging.getLogger(__name__)
+def project_image(header, proj_dir, img):
+    base = os.path.basename(img)
+    out_img = os.path.join(proj_dir, base)
+    rtn = mProjectQL(img, out_img, header)
+    print(f"Project {img}: {rtn}")
+    return (img, rtn['status'], rtn.get('msg', 'unknown error') if rtn['status'] != '0' else '')
 
+def diff_fit(pimages, diffs_dir, header, overlap):
+    plus, minus, diff_base = overlap
+    img1 = pimages[plus]
+    img2 = pimages[minus]
+    diff_file = os.path.join(diffs_dir, diff_base)
+    rtn_diff = mDiff(img1, img2, diff_file, header)
+    print(f"mDiff {plus}-{minus}: {rtn_diff}")
+    if rtn_diff['status'] != '0':
+        return None
 
-class OptionGroup:
-    """Compat wrapper that mimics optparse.OptionGroup using argparse groups."""
-    def __init__(self, parser: argparse.ArgumentParser, title: str, description: str | None = None):
-        self._group = parser.add_argument_group(title=title, description=description)
+    rtn_fit = mFitplane(diff_file)
+    print(f"mFitplane {diff_base}: {rtn_fit}")
+    if rtn_fit['status'] != '0':
+        return None
 
-    def add_argument(self, *args, **kwargs):
-        return self._group.add_argument(*args, **kwargs)
+    return (plus, minus, rtn_fit['a'], rtn_fit['b'], rtn_fit['c'],
+            rtn_fit['xmin'], rtn_fit['ymin'], rtn_fit['xmax'], rtn_fit['ymax'],
+            rtn_fit['xcenter'], rtn_fit['ycenter'], int(rtn_fit['npixel']),
+            rtn_fit['xrms'], rtn_fit['yrms'], rtn_fit['rss'],
+            rtn_fit['boxx'], rtn_fit['boxy'], rtn_fit['boxwidth'],
+            rtn_fit['boxheight'], rtn_fit['boxang'])
 
-    # Backward-compat alias for older code that called add_option(...)
-    add_option = add_argument
+def bg_correct(pimages, corr_dir, corrections_tbl, idx):
+    img = pimages[idx]
+    base = os.path.basename(img)
+    out_img = os.path.join(corr_dir, base)
+    rtn = mBackground(img, out_img, corrections_tbl)
+    print(f"mBackground {idx}: {rtn}")
+    return rtn['status']
 
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
 
-description = """
-Use the Montage (Montage Astronomical Image Mosaic Engine) toolkit [1] to
-assemble the input FITS images into a composite mosaic that preserves their
-flux calibration and positional fidelity. This command now uses the MontagePy
-Python bindings to run the standard Montage workflow (reproject, optional
-background matching, and co-add).
+    parser = argparse.ArgumentParser(description='Create image mosaic using MontagePy')
+    parser.add_argument('files', nargs='+', help='Input FITS files followed by output FITS file')
+    parser.add_argument('--background-match', action='store_true', help='Enable background matching')
+    parser.add_argument('--combine', default='mean', choices=['mean', 'median', 'count'], help='Coaddition type')
+    parser.add_argument('--ncores', type=int, default=mp.cpu_count(), help='Number of cores for parallel processing')
+    args = parser.parse_args(argv)
 
-The input FITS images, all of which must have WCS (astrometrically calibrated),
-are reprojected onto a common coordinate system and combined into a mosaic.
+    if len(args.files) < 2:
+        parser.error('At least one input file and one output file required')
 
-[1] http://montage.ipac.caltech.edu/
-"""
+    input_files = args.files[:-1]
+    output_file = args.files[-1]
 
-# Parser
-parser = customparser.get_parser(description)
-parser.usage = "%(prog)s [OPTION]... INPUT_IMGS... OUTPUT_IMG"
+    # Verify input files are FITS
+    for f in input_files:
+        if not f.lower().endswith(('.fits', '.fit')):
+            sys.stderr.write(f"Warning: {f} does not appear to be a FITS file\n")
 
-# Flags / options
-parser.add_argument(
-    "--overwrite",
-    action="store_true",
-    dest="overwrite",
-    help="overwrite output image if it already exists",
-)
-
-parser.add_argument(
-    "--background-match",
-    action="store_true",
-    dest="background_match",
-    help=(
-        "include a background-matching step (model and remove background differences). "
-        "This improves seams but takes longer."
-    ),
-)
-
-parser.add_argument(
-    "--no-reprojection",
-    action="store_false",
-    dest="reproject",
-    default=True,
-    help="(kept for backward compatibility) With MontagePy the template header controls orientation.",
-)
-
-parser.add_argument(
-    "--combine",
-    dest="combine",
-    choices=("mean", "median", "count"),
-    default="mean",
-    help="how FITS images are combined: %(choices)s [default: %(default)s]",
-)
-
-parser.add_argument(
-    "--filter",
-    dest="filter",
-    type=str,
-    default=None,
-    help=(
-        "only combine FITS files taken in this photometric filter. "
-        + defaults.desc["filter"]
-    ),
-)
-
-parser.add_argument(
-    "--cores",
-    dest="ncores",
-    type=int,
-    default=multiprocessing.cpu_count(),
-    help="number of worker processes for reprojection (use 1..N CPUs).",
-)
-
-# Argument group for FITS keywords
-key_group = OptionGroup(parser, "FITS Keywords", keywords.group_description)
-key_group.add_argument(
-    "--filterk",
-    dest="filterk",
-    type=str,
-    default=keywords.filterk,
-    help="keyword for the observation filter name. Only relevant when using --filter. [default: %(default)s]",
-)
-
-# Positional args: paths (>=3): N input FITS + 1 output FITS
-parser.add_argument(
-    "paths",
-    nargs="+",
-    help="two or more input FITS files followed by the output FITS path",
-)
-
-customparser.clear_metavars(parser)
-
-
-# ---------- helpers ----------
-_FITS_EXTS = {".fits", ".fit", ".fts"}
-
-def _iter_fits(dir_path: Path) -> list[Path]:
-    return [p for p in sorted(Path(dir_path).iterdir()) if p.suffix.lower() in _FITS_EXTS]
-
-def _reproj_one(src: str, dst: str, hdr: str) -> dict:
-    ## Calls mProjectPP if available; otherwise mProject.
-    return _mProject(src, dst, hdr, noAreas=True)
-
-
-def main(arguments: list[str] | None = None) -> int:
-    """Entry point to run mosaicking."""
-    if arguments is None:
-        arguments = sys.argv[1:]
-
-    opts = parser.parse_args(arguments)
-    if len(opts.paths) < 3:
-        parser.print_help()
-        return 2
-
-    input_paths = set(opts.paths[:-1])
-    out_path = Path(opts.paths[-1])
-
-    # Overwrite handling
-    if out_path.exists() and not opts.overwrite:
-        print(f"{style.prefix}Error. The output file '{out_path}' already exists.")
-        print(style.error_exit_message)
-        return 1
-    if out_path.exists() and opts.overwrite:
-        try:
-            out_path.unlink()
-        except Exception:
-            pass
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Map each filter to a list of FITSImage objects
-    files = fitsimage.InputFITSFiles()
-
-    print(f"{style.prefix}Making sure the {len(input_paths)} input paths are FITS images...")
-
-    show_progress(0.0)
-    for index, path in enumerate(input_paths):
-        try:
-            img = fitsimage.FITSImage(path)
-            pfilter = img.pfilter(opts.filterk) if opts.filter else None
-            files[pfilter].append(img)
-        except fitsimage.NonStandardFITS:
-            print()
-            msg = f"'{path}' is not a standard FITS file"
-            raise fitsimage.NonStandardFITS(msg)
-
-        percentage = (index + 1) / len(input_paths) * 100.0
-        show_progress(percentage)
-    print()  # newline after progress
-
-    # If --filter provided, keep only that filter
-    if opts.filter:
-        print(f"{style.prefix}{len(files.keys())} different photometric filters were detected:")
-
-        total_imgs = sum(len(v) for v in files.values()) or 1
-        for pfilter, images in sorted(files.items()):
-            pct = (len(images) / total_imgs) * 100.0
-            print(f"{style.prefix} {pfilter}: {len(images)} files ({pct:.2f} %)")
-
-        print(f"{style.prefix}Ignoring images not taken in the '{opts.filter}' photometric filter...", end="")
-        sys.stdout.flush()
-
-        discarded = 0
-        to_delete = [pf for pf in list(files.keys()) if pf != opts.filter]
-        for pf in to_delete:
-            discarded += len(files[pf])
-            del files[pf]
-
-        if not files:
-            print()
-            print(f"{style.prefix}Error. No image was taken in the '{opts.filter}' filter.")
-            print(style.error_exit_message)
-            return 1
-        else:
-            print(" done.")
-            kept = sum(len(v) for v in files.values())
-            print(f"{style.prefix}{kept} images taken in the '{opts.filter}' filter, {discarded} were discarded.")
-
-    # Ensure all images have WCS info
-    for img in files:
-        img.center_wcs()  # may raise NoWCSInformationError
-
-    # Prepare temp input dir with symlinks to input images
     pid = os.getpid()
-    suffix = f"_LEMON_{pid}_mosaic"
 
-    input_dir = tempfile.mkdtemp(suffix=suffix + "_input")
-    atexit.register(clean_tmp_files, input_dir)
+    # Create temporary work directory
+    work_dir = tempfile.mkdtemp(suffix=f'_LEMON_{pid}_mosaic_work')
+    atexit.register(clean_dir, work_dir)
+    os.chdir(work_dir)
 
-    for img in files:
-        src_path = Path(img.path).resolve()
-        link_name = Path(input_dir) / src_path.name
-        os.symlink(src_path, link_name)
+    print(f"Working directory: {work_dir}")
 
-    # Prepare temp working dir
-    work_dir = tempfile.mkdtemp(suffix=suffix + "_output")
-    atexit.register(clean_tmp_files, work_dir)
+    # Create input directory with symlinks
+    input_dir = tempfile.mkdtemp(dir=work_dir, suffix='_input')
+    atexit.register(clean_dir, input_dir)
+    for path in input_files:
+        source = os.path.abspath(path)
+        basename = os.path.basename(path)
+        link_name = os.path.join(input_dir, basename)
+        os.symlink(source, link_name)
+        print(f"Symlinked {source} to {link_name}")
 
-    # --- MontagePy workflow ---
-    rimages = Path(work_dir) / "rimages.tbl"   # table of raw inputs
-    pimages = Path(work_dir) / "pimages.tbl"   # table of projected images
-    cimages = Path(work_dir) / "cimages.tbl"   # table of corrected images
-    diffs   = Path(work_dir) / "diffs.tbl"
-    fits    = Path(work_dir) / "fits.tbl"
-    hdr     = Path(work_dir) / "mosaic.hdr"
-    projdir = Path(work_dir) / "projected"
-    corrdir = Path(work_dir) / "corrected"
-    diffdir = Path(work_dir) / "diffs"
-    projdir.mkdir(exist_ok=True)
-    corrdir.mkdir(exist_ok=True)
-    diffdir.mkdir(exist_ok=True)
+    # Create image table for raw images
+    raw_tbl = 'rimages.tbl'
+    rtn = mImgtbl(input_dir, raw_tbl)
+    print(f"mImgtbl return: {rtn}")
+    if rtn['status'] != '0':
+        raise RuntimeError(f"mImgtbl failed: {rtn}")
+    if rtn['count'] == 0:
+        raise RuntimeError("No valid images found")
+    print(f"Found {rtn['count']} valid images, {rtn.get('badwcs', 0)} bad WCS, {rtn.get('badfits', 0)} bad FITS")
 
-    # 1) Index inputs and build a template header
-    mImgtbl(str(input_dir), str(rimages))
-    mMakeHdr(str(rimages), str(hdr))
+    # Create output header
+    header = 'region.hdr'
+    rtn = mMakeHdr(raw_tbl, header)
+    print(f"mMakeHdr return: {rtn}")
+    if rtn['status'] != '0':
+        raise RuntimeError(f"mMakeHdr failed: {rtn}")
 
-    # 2) Reproject all inputs to the template geometry — PARALLEL
-    #    We use mProjectPP in parallel (same as mProjExec quickMode=True).
-    ### PARALLEL REPROJECTION ###################################################
-    print(f"{style.prefix}Reprojecting inputs with up to {opts.ncores} worker(s)...")
-    in_files: list[Path] = _iter_fits(Path(input_dir))
-    total = len(in_files)
-    if total == 0:
-        print(f"{style.prefix}Error. No FITS files found to reproject.")
-        return 1
+    # Create projected directory
+    proj_dir = tempfile.mkdtemp(dir=work_dir, suffix='_projected')
+    atexit.register(clean_dir, proj_dir)
 
-    show_progress(0.0)
-    completed = 0
-    errors: list[tuple[str, str]] = []
+    # Get input images list
+    raw_data = read_montage_table(raw_tbl)
+    input_images = [os.path.join(input_dir, row[-1]) for row in raw_data]
+    print("Input images for projection:")
+    for img in input_images:
+        print(img)
+        if not os.path.exists(img):
+            print(f"Warning: File does not exist: {img}")
 
-    def _task_tuple_iter(files: Iterable[Path]) -> list[tuple[str, str, str]]:
-        jobs = []
-        for f in files:
-            dst = projdir / f.name  # keep original filenames
-            jobs.append((str(f), str(dst), str(hdr)))
-        return jobs
+    # Parallel projection
+    pool = mp.Pool(args.ncores) if args.ncores > 1 else None
+    project_func = partial(project_image, header, proj_dir)
+    if pool:
+        results = pool.map(project_func, input_images)
+    else:
+        results = [project_func(img) for img in input_images]
 
-    jobs = _task_tuple_iter(in_files)
+    failed = [(orig, msg) for orig, stat, msg in results if stat != '0']
+    if failed:
+        print("Failed projections:")
+        for orig, msg in failed:
+            print(f"{orig}: {msg}")
 
-    # Cap workers to something sensible
-    max_workers = max(1, int(opts.ncores or 1))
-    try:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_reproj_one, src, dst, hdr_path) for (src, dst, hdr_path) in jobs]
-            for fut in as_completed(futures):
-                try:
-                    _ = fut.result()  # Montage returns a dict; ignore unless you want to log it
-                except Exception as e:
-                    # Grab a representative source path for context
-                    idx = futures.index(fut)
-                    src_path = jobs[idx][0] if 0 <= idx < len(jobs) else "UNKNOWN"
-                    errors.append((src_path, str(e)))
-                finally:
-                    completed += 1
-                    show_progress(completed * 100.0 / total)
-    except KeyboardInterrupt:
-        print("\n" + f"{style.prefix}Interrupted. Partial outputs in: {projdir}")
-        raise
-    print()  # newline after progress
+    num_failed = len(failed)
+    if num_failed == len(input_images):
+        raise RuntimeError("All projections failed")
+    elif num_failed > 0:
+        print(f"{num_failed} projections failed, continuing with {len(input_images) - num_failed} successful ones")
 
-    if errors:
-        print(f"{style.prefix}Reprojection failed for {len(errors)} file(s):")
-        for src, err in errors[:5]:  # avoid dumping too much
-            print(f"{style.prefix} - {src}: {err}")
-        print(style.error_exit_message)
-        return 1
-    ### END PARALLEL REPROJECTION ###############################################
+    # Create image table for projected images
+    pimages_tbl = 'pimages.tbl'
+    rtn = mImgtbl(proj_dir, pimages_tbl)
+    print(f"mImgtbl projected: {rtn}")
+    if rtn['status'] != '0':
+        raise RuntimeError(f"mImgtbl (projected) failed: {rtn}")
 
-    # Always build a table of projected images (used by coadd or bg-match)
-    mImgtbl(str(projdir), str(pimages))
-    use_dir = projdir
-    table_for_add = pimages
+    coadd_map = {'mean': 0, 'median': 1, 'count': 2}
+    coadd_type = coadd_map[args.combine]
 
-    # 3) Optional background matching (sequential; heavy parts are already parallelized)
-    if opts.background_match:
-        print(f"{style.prefix}Computing overlaps & background model...")
-        mOverlaps(str(pimages), str(diffs))
-        mDiffFitExec(str(projdir), str(diffs), str(hdr), str(diffdir), str(fits))
-        corrections = Path(work_dir) / "corrections.tbl"
-        mBgModel(str(pimages), str(fits), str(corrections))
-        mBgExec(str(projdir), str(pimages), str(corrections), str(corrdir))
-        mImgtbl(str(corrdir), str(cimages))
-        use_dir = corrdir
-        table_for_add = cimages
+    if not args.background_match:
+        # Direct coadd without background correction
+        rtn = mAdd(proj_dir, pimages_tbl, header, output_file, coadd=coadd_type)
+        print(f"mAdd: {rtn}")
+        if rtn['status'] != '0':
+            raise RuntimeError(f"mAdd failed: {rtn}")
+    else:
+        # Background correction steps
+        diffs_dir = tempfile.mkdtemp(dir=work_dir, suffix='_diffs')
+        atexit.register(clean_dir, diffs_dir)
 
-    # 4) Co-add to make the mosaic — write DIRECTLY to final output path
-    coadd_mode = {"mean": 0, "median": 1, "count": 2}[opts.combine]
-    mAdd(
-        str(use_dir),           # directory with projected/corrected images
-        str(table_for_add),     # table listing those images
-        str(hdr),               # template header (controls geometry/orientation)
-        str(out_path),          # <-- final mosaic file (no cross-device move needed)
-        haveAreas=False,         # area files used for weighting
-        coadd=coadd_mode,       # 0=MEAN, 1=MEDIAN, 2=COUNT
-    )
+        overlaps_tbl = 'overlaps.tbl'
+        rtn = mOverlaps(pimages_tbl, overlaps_tbl)
+        print(f"mOverlaps: {rtn}")
+        if rtn['status'] != '0':
+            raise RuntimeError(f"mOverlaps failed: {rtn}")
 
-    print(f"{style.prefix}Template-driven orientation already applied; saving mosaic... done.")
-    print(f"{style.prefix}You're done ^_^")
-    return 0
+        # Parse overlaps table
+        overlaps_data = []
+        overlaps_raw = read_montage_table(overlaps_tbl)
+        for row in overlaps_raw:
+            cntr = int(row[0])
+            plus = int(row[1])
+            minus = int(row[2])
+            diff_base = row[3]
+            overlaps_data.append((plus, minus, diff_base))
 
+        # Parse pimages table for image paths (cntr starts at 1)
+        pimages_raw = read_montage_table(pimages_tbl)
+        max_cntr = max(int(row[0]) for row in pimages_raw)
+        pimages = [''] * (max_cntr + 1)
+        for row in pimages_raw:
+            cntr = int(row[0])
+            fname = row[-1]
+            pimages[cntr] = os.path.join(proj_dir, fname)
+            if not os.path.exists(pimages[cntr]):
+                print(f"Warning: Projected file does not exist: {pimages[cntr]}")
 
-if __name__ == "__main__":
-    sys.exit(main())
+        # Parallel diff and fit
+        diff_fit_func = partial(diff_fit, pimages, diffs_dir, header)
+        if pool:
+            fits_data = pool.map(diff_fit_func, overlaps_data)
+        else:
+            fits_data = [diff_fit_func(o) for o in overlaps_data]
+        fits_data = [d for d in fits_data if d is not None]
+        if len(fits_data) != len(overlaps_data):
+            print(f"Some diff/fit failed, got {len(fits_data)} out of {len(overlaps_data)}")
+            raise RuntimeError("Some diff/fit operations failed")
+
+        # Write fits.tbl
+        fits_tbl = 'fits.tbl'
+        with open(fits_tbl, 'w') as f:
+            f.write('\\ No backslash at start\n')
+            f.write('|plus|minus|a|b|c|xmin|ymin|xmax|ymax|xcenter|ycenter|npixel|xrms|yrms|rss|boxx|boxy|boxwidth|boxheight|boxang|\n')
+            for d in fits_data:
+                f.write(f" {d[0]:4d} {d[1]:4d} {d[2]:12.5e} {d[3]:12.5e} {d[4]:12.5e} {d[5]:6.1f} {d[6]:6.1f} {d[7]:6.1f} {d[8]:6.1f} {d[9]:8.3f} {d[10]:8.3f} {d[11]:7d} {d[12]:6.4f} {d[13]:6.4f} {d[14]:10.4f} {d[15]:6.1f} {d[16]:6.1f} {d[17]:6.1f} {d[18]:6.1f} {d[19]:6.1f}\n")
+
+        # Background modeling
+        corrections_tbl = 'corrections.tbl'
+        rtn = mBgModel(pimages_tbl, fits_tbl, corrections_tbl)
+        print(f"mBgModel: {rtn}")
+        if rtn['status'] != '0':
+            raise RuntimeError(f"mBgModel failed: {rtn}")
+
+        # Create corrected directory
+        corr_dir = tempfile.mkdtemp(dir=work_dir, suffix='_corrected')
+        atexit.register(clean_dir, corr_dir)
+
+        # Parallel background correction
+        bg_correct_func = partial(bg_correct, pimages, corr_dir, corrections_tbl)
+        p_indices = [int(row[0]) for row in pimages_raw]
+
+        if pool:
+            statuses = pool.map(bg_correct_func, p_indices)
+        else:
+            statuses = [bg_correct_func(idx) for idx in p_indices]
+        failed_bg = [i for i, s in zip(p_indices, statuses) if s != '0']
+        if failed_bg:
+            print(f"Failed background corrections for indices: {failed_bg}")
+            raise RuntimeError("Some background corrections failed")
+
+        # Create image table for corrected images
+        cimages_tbl = 'cimages.tbl'
+        rtn = mImgtbl(corr_dir, cimages_tbl)
+        print(f"mImgtbl corrected: {rtn}")
+        if rtn['status'] != '0':
+            raise RuntimeError(f"mImgtbl (corrected) failed: {rtn}")
+
+        # Final coadd
+        rtn = mAdd(corr_dir, cimages_tbl, header, output_file, coadd=coadd_type)
+        print(f"Final mAdd: {rtn}")
+        if rtn['status'] != '0':
+            raise RuntimeError(f"mAdd failed: {rtn}")
+
+    if pool:
+        pool.close()
+
+    print(f"Mosaic created at {output_file}")
+
+if __name__ == '__main__':
+    main()
