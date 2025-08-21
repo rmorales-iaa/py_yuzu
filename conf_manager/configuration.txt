@@ -39,3 +39,5 @@ dec = 240
 width = 864
 height = 867
 
+[parallel]
+ncores = 16

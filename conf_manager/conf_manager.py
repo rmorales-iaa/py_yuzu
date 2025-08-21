@@ -315,6 +315,9 @@ class ConfigManager:
             "ra": "240",
             "dec": "240",
         }
+        self.cfg["parallel"] = {
+            "ncores": "16",
+        }
 
 
 cfg = ConfigManager()
