@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
+
+from conf_manager.conf_manager import cfg
 
 # Copyright (c) 2012 Victor Terron. All rights reserved.
 # Institute of Astrophysics of Andalusia, IAA-CSIC
@@ -14,7 +17,7 @@ import logging
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# This program is distributed in the hope that it will be useful,
+# LEMON is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
@@ -24,14 +27,12 @@ import logging
 
 """Definition of the default options used by the different modules."""
 
-import multiprocessing
-
 # LEMON modules
 import setup
 
 desc: dict[str, str] = {}  # option descriptions
 
-ncores = multiprocessing.cpu_count()
+ncores = cfg.getint("parallel", "ncores", 16)
 desc["ncores"] = (
     "the maximum number of cores available to the module. This option "
     "defaults to the number of CPUs in the system, which are automatically "
@@ -84,5 +85,31 @@ desc["filter"] = (
     "In addition to the built-in photometric systems, custom filters are "
     f"supported via the {setup.CONFIG_FILENAME} configuration file."
 )
+
+# ----------------------------------------------------------------------
+# Additional defaults required by diffphot.py
+# ----------------------------------------------------------------------
+
+# Fraction of stars discarded at each iteration when selecting best set
+FRACTION = 0.10
+
+# Minimum number of images in which a star must be observed
+MIN_IMAGES = 10
+
+# Number of stars used to build the artificial comparison star
+STARS = 20
+
+# Minimum number of stars required to compute the artificial comparison star
+MIN_CSTARS = 8
+
+# Number of stars to keep as the "best" set when selecting
+BEST_STARS = 20
+
+# Polynomial fitting defaults
+DEGREE = 2
+MAX_DEGREE = 5
+
+# Number of best stars to use when computing comparison set (diffphot)
+BEST_STARS = 100
 
 logger = logging.getLogger(__name__)

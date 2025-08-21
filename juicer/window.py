@@ -204,7 +204,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         hb = Gtk.HeaderBar.new()
         self.set_titlebar(hb)
         open_btn = Gtk.Button.new_from_icon_name("document-open-symbolic")
-        open_btn.set_tooltip_text("Open LEMON database…")
+        open_btn.set_tooltip_text("Open LEMON database?")
         open_btn.connect("clicked", self._on_open_clicked)
         hb.pack_start(open_btn)
 
@@ -526,7 +526,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"LEMON juicer — {Path(db_path).name}")
+        self.set_title(f"LEMON juicer ? {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
         self._populate_overview_from_miner(miner)
 
@@ -614,7 +614,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         return False
 
     def _reveal_sorted_position(self, pos: int) -> None:
-        """Bring row at `pos` into view — immediate attempts only."""
+        """Bring row at `pos` into view ? immediate attempts only."""
         # A) ColumnView API
         try:
             self._view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, None)  # type: ignore[attr-defined]
@@ -722,9 +722,9 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         r = float(getattr(target_row.props, "ra", float("nan")))
         d = float(getattr(target_row.props, "dec", float("nan")))
         sep = self._angsep_deg(ra_deg, dec_deg, r, d)
-        logger.info("Auto-selected nearest: ID=%s  RA=%s  Dec=%s  (sep=%.2f arcmin)",
+        logger.info("Auto-selected nearest: ID=%s  RA=%s  Dec=%s  (dist=%.2f mas)",
                     int(getattr(target_row.props, "id", -1)),
-                    _hms_from_deg(r), _dms_from_deg(d), sep * 60.0)
+                    _hms_from_deg(r), _dms_from_deg(d), sep * 3600000.0)
 
         # One quick reassert if a resort immediately moved it
         def _reassert(*_a):
@@ -955,7 +955,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         n_filters = len(getattr(miner, "pfilters", []))
         field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
-        self._set_status(f"Field: {field} — Stars shown: {n_added} — Filters: {n_filters}")
+        self._set_status(f"Field: {field} ? Stars shown: {n_added} ? Filters: {n_filters}")
 
         # Initial autoselect (if requested)
         self._ensure_autoselect_when_ready()
