@@ -333,9 +333,9 @@ def load_stars(db, pfilter):
         complete_images = None
         image_ids = db.images(pfilter=pfilter, star_ids=[star_id])
 
-        if len(image_ids) < options.min_images:
+        if len(image_ids) < options.minimum_images:
             logging.debug("Star %d: ignored (minimum of %d images not met)"
-                          % (star_id, options.min_images))
+                          % (star_id, options.minimum_images))
             continue
 
         # candidate stars are those that appear in all images of this star
@@ -404,19 +404,13 @@ def mean_magnitude(star, cstars, image_id):
 # --------------------
 
 
-def show_progress(percentage):
-
-    # Print a progress bar on the screen. 'percentage' must be in the (0, 100]
-    # range. The function uses a 70-character bar.
-
-    GUI_WIDTH = 70
-
-    percentage = min(100.0, max(0.0, float(percentage)))
-    n = int(GUI_WIDTH * percentage / 100)
-
-    fmt = "\r%3.0f%%[%%s>]"
-    bar = '=' * (n - 1) + '>' + ' ' * (GUI_WIDTH - n)
-    sys.stdout.write(fmt % (percentage, bar))
+def show_progress(fraction):
+    """fraction in [0, 1]"""
+    width = 50
+    done = int(round(width * max(0.0, min(1.0, fraction))))
+    bar = "#" * done + "-" * (width - done)
+    percentage = int(round(100 * fraction))
+    sys.stdout.write(f"\r>> {percentage:3d}% [{bar}]")
     sys.stdout.flush()
 
 
@@ -626,7 +620,10 @@ def main(argv=None):
         # Update statistics about tables and indexes
         print(">> Updating statistics about tables and indexes...", end=' ')
         sys.stdout.flush()
-        db.analyze()
+        try:
+            db.analyze()
+        except sqlite3.OperationalError as e:
+            logging.warning("ANALYZE skipped (%s)", e)
         print("done.")
 
         # Update LEMONdB metadata

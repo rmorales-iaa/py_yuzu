@@ -27,6 +27,10 @@ import json_parse
 import passband
 import util
 
+class _ListCallable(list):
+    """List that can also be called like a function to return a plain list."""
+    def __call__(self):
+        return list(self)
 
 class DBStar(object):
     """Encapsulates the instrumental photometric information for a star.
@@ -310,6 +314,12 @@ class LEMONdB(object):
         self._start()
         self._create_tables()
         self.commit()
+
+    def nstars(self):
+        return len(self)
+
+    def filters(self):
+        return list(self.pfilters)
 
     def _close(self):
         self._cursor.close()
@@ -858,7 +868,50 @@ class LEMONdB(object):
     def star_ids(self):
         """Return a list with the ID of the stars, in ascending order."""
         self._execute("SELECT id FROM stars ORDER BY id ASC")
-        return [x[0] for x in self._rows]
+        return _ListCallable([x[0] for x in self._rows])
+
+    def images(self, pfilter, star_ids=None):
+        """Return a sorted list of Unix times for images in a photometric filter.
+
+        If 'star_ids' is provided (iterable of ints), only return the Unix times
+        of images in which *all* those stars have photometry in that filter.
+        """
+        # Accept strings too; normalize to Passband because DB stores hash(pfilter)
+        if not isinstance(pfilter, passband.Passband):
+            pfilter = passband.Passband(str(pfilter))
+
+        if not star_ids:
+            # All images for the filter
+            self._execute(
+                "SELECT unix_time "
+                "FROM images INDEXED BY img_by_filter_time "
+                "WHERE filter_id = ? "
+                "ORDER BY unix_time ASC",
+                (hash(pfilter),),
+            )
+            return [row[0] for row in self._rows]
+
+        # Ensure we have a concrete list and it’s not empty
+        star_ids = list(star_ids)
+        if not star_ids:
+            return []
+
+        # Images in this filter that have photometry for *all* given stars.
+        # We group by image and require count(distinct star_id) == number of stars.
+        placeholders = ",".join("?" for _ in star_ids)
+        params = [hash(pfilter)] + star_ids + [len(star_ids)]
+        self._execute(
+            "SELECT img.unix_time "
+            "FROM images AS img INDEXED BY img_by_filter_time "
+            "JOIN photometry AS phot INDEXED BY phot_by_image "
+            "  ON phot.image_id = img.id "
+            f"WHERE img.filter_id = ? AND phot.star_id IN ({placeholders}) "
+            "GROUP BY img.id "
+            "HAVING COUNT(DISTINCT phot.star_id) = ? "
+            "ORDER BY img.unix_time ASC",
+            tuple(params),
+        )
+        return [row[0] for row in self._rows]
 
     def add_pm_correction(self, star_id, unix_time, pfilter, pm_x, pm_y):
         """Store the proper-motion corrected pixel coordinates of a star."""
