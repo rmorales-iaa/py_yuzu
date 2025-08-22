@@ -1,21 +1,7 @@
 # juicer/star_window.py
-# GTK 4 Star details window with robust data loading and modern widgets.
-#
-# What you get:
-# - Flexible ctor: StarDetailsWindow(parent, row, miner)  OR  StarDetailsWindow(parent, data=<dict>, miner=?)
-# - Auto-populates ID/RA/Dec/Mag + Filter + #Points
-# - Loads light-curve + reference stars in 3 layers:
-#     1) Miner APIs (get_light_curve / get_curve / lightcurve_for_star …)
-#     2) SQLAlchemy session on miner (sa_session) with safe text queries
-#     3) Raw .LEMONdB file via your shipped database.LEMONdB helper
-# - Reference stars list shows (id, weight, σ) when available
-# - Curve points are listed and plotted (Matplotlib GTK4; soft fallback if mpl not present)
-# - Optional theming & geometry via conf_manager (if available)
-#
-# This file is self-contained: no UI files required.
+# GTK4 Star details — accepts StarDetailsWindow(parent, data=...) and supports set_star_data(...)
 
 from __future__ import annotations
-
 import io
 import logging
 import math
@@ -24,19 +10,20 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import gi
+
+from mining import LEMONdBMiner
+
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore
 
-# ------------- Logging -------------
 logger = logging.getLogger(__name__)
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# ------------- Optional config/theming -------------
+# ---------- optional config/theming ----------
 try:
-    # Single instance in your project; if missing we keep running
     from .conf_manager import cfg  # type: ignore
 except Exception:
     try:
@@ -69,8 +56,6 @@ def _install_theme_css() -> None:
         provider.load_from_data(f"""
             .lemon-surface * {{ color: {_FG}; }}
             .lemon-surface {{ background: {_BG}; }}
-            .lemon-btn {{ color: {_FG}; background: transparent; border: 1px solid {_FG}22; }}
-            .lemon-btn:hover {{ border-color: {_ACC}; }}
             .monospace {{ font-family: monospace; }}
         """.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_display(
@@ -79,16 +64,16 @@ def _install_theme_css() -> None:
     except Exception:
         pass
 
-# ------------- Utility formatters -------------
+# ---------- format helpers ----------
 def _hms_from_deg(ra_deg: float) -> str:
     ra = (ra_deg / 15.0) % 24.0
-    h = int(ra); m = int((ra - h) * 60.0); s = (ra - h - m / 60.0) * 3600.0
+    h = int(ra); m = int((ra - h) * 60.0); s = (ra - h - m/60.0) * 3600.0
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 def _dms_from_deg(dec_deg: float) -> str:
     sign = "-" if dec_deg < 0 else "+"
     dabs = abs(dec_deg)
-    d = int(dabs); m = int((dabs - d) * 60.0); s = (dabs - d - m / 60.0) * 3600.0
+    d = int(dabs); m = int((dabs - d) * 60.0); s = (dabs - d - m/60.0) * 3600.0
     return f"{sign}{d:02d}:{m:02d}:{s:05.2f}"
 
 def _fmt_time(unix: float) -> str:
@@ -96,7 +81,7 @@ def _fmt_time(unix: float) -> str:
         import datetime as _dt
         return _dt.datetime.utcfromtimestamp(float(unix)).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return f"{float(unix):.1f}"
+        return f"{float(unix):.6f}"
 
 def _format_mag(x: Optional[float]) -> str:
     try:
@@ -106,9 +91,9 @@ def _format_mag(x: Optional[float]) -> str:
     except Exception:
         return str(x)
 
-# ------------- Light-curve normalization -------------
+# ---------- curve normalization ----------
 def _curve_to_points(curve: Any) -> List[Tuple[float, float, Optional[float]]]:
-    """Return list of (unix_time, mag, snr|None) from various curve shapes."""
+    """Return list[(unix_time, mag, snr|None)] from many shapes."""
     if curve is None:
         return []
     pts: List[Tuple[float, float, Optional[float]]] = []
@@ -116,7 +101,7 @@ def _curve_to_points(curve: Any) -> List[Tuple[float, float, Optional[float]]]:
         for item in curve:
             try:
                 t, mag, snr = item  # type: ignore[misc]
-                pts.append((float(t), float(mag), None if snr is None else float(snr)))
+                pts.append((float(t), float(mag), (None if snr is None else float(snr))))
             except Exception:
                 continue
         if pts:
@@ -132,7 +117,7 @@ def _curve_to_points(curve: Any) -> List[Tuple[float, float, Optional[float]]]:
     return []
 
 def _curve_cstars_with_weights(curve: Any) -> Optional[List[Tuple[int, float, float]]]:
-    """Return (id, weight, stdev) if available on curve object."""
+    """Try (id, weight, stdev)."""
     try:
         ws = list(getattr(curve, "weights")())
         if ws:
@@ -150,8 +135,8 @@ def _curve_cstars_with_weights(curve: Any) -> Optional[List[Tuple[int, float, fl
         cstars = list(getattr(curve, "cstars"))
         wts    = list(getattr(curve, "cweights"))
         stds   = list(getattr(curve, "cstdevs"))
-        if cstars and len(cstars) == len(wts) == len(stds):
-            return [(int(s), float(w), float(st)) for s, w, st in zip(cstars, wts, stds)]
+        if cstars and len(cstars) == len(wts) == len(sts := stds):
+            return [(int(s), float(w), float(st)) for s, w, st in zip(cstars, wts, sts)]
     except Exception:
         pass
     return None
@@ -165,9 +150,8 @@ def _curve_cstars_ids_only(curve: Any) -> Optional[Iterable[int]]:
         pass
     return None
 
-# ------------- Miner & DB helpers -------------
+# ---------- miner & DB helpers ----------
 def _iter_filters(miner: Any):
-    """Yield candidate filters from miner in a sensible order, without duplicates."""
     seen = set()
     for name in ("selected_filter", "current_filter", "default_filter"):
         pf = getattr(miner, name, None)
@@ -181,7 +165,6 @@ def _iter_filters(miner: Any):
             seen.add(key); yield pf
 
 def _collect_best_light_curve(miner: Any, star_id: int) -> Tuple[Any | None, Any | None]:
-    """Try common miner APIs across likely filters and return the first non-empty curve."""
     names = ("get_light_curve", "get_curve", "light_curve_for_star",
              "lightcurve_for_star", "light_curve")
     for pf in _iter_filters(miner):
@@ -198,7 +181,6 @@ def _collect_best_light_curve(miner: Any, star_id: int) -> Tuple[Any | None, Any
                     return curve, pf
             except Exception:
                 continue
-    # No filter argument case
     for name in names:
         f = getattr(miner, name, None)
         if not callable(f):
@@ -212,12 +194,10 @@ def _collect_best_light_curve(miner: Any, star_id: int) -> Tuple[Any | None, Any
     return None, None
 
 def _find_db_path(miner: Any, parent: Optional[Gtk.Window] = None) -> Optional[str]:
-    """Best-effort DB path discovery."""
     for attr in ("path", "db_path", "database_path", "dbfile", "filename"):
         p = getattr(miner, attr, None)
         if isinstance(p, str) and p:
             return p
-        # Path object?
         try:
             if hasattr(p, "__fspath__"):
                 return str(p)  # type: ignore[arg-type]
@@ -233,7 +213,6 @@ def _find_db_path(miner: Any, parent: Optional[Gtk.Window] = None) -> Optional[s
     return None
 
 def _collect_via_sqlalchemy(miner: Any, star_id: int) -> Tuple[Any | None, Any | None]:
-    """SQLAlchemy fallback: pick filter with most points and return curve + pfilter."""
     sess = getattr(miner, "sa_session", None)
     if sess is None:
         return None, None
@@ -242,7 +221,6 @@ def _collect_via_sqlalchemy(miner: Any, star_id: int) -> Tuple[Any | None, Any |
     except Exception:
         return None, None
 
-    # Choose best filter by number of points
     row = sess.execute(text("""
         SELECT pf.id AS filter_id, pf.name AS fname, COUNT(*) AS n
         FROM light_curves lc
@@ -279,7 +257,7 @@ def _collect_via_sqlalchemy(miner: Any, star_id: int) -> Tuple[Any | None, Any |
     class _LC:
         def __init__(self, pts, refs, fname):
             self._data = [(float(t), float(m), (None if s is None else float(s))) for (t, m, s) in pts]
-            self.cstars   = [int(s) for (s, *_rest) in refs]
+            self.cstars   = [int(s) for (s, *_r) in refs]
             self.cweights = [float(w) for (_s, w, _st) in refs]
             self.cstdevs  = [float(st) for (_s, _w, st) in refs]
             self.pfilter  = fname
@@ -290,7 +268,6 @@ def _collect_via_sqlalchemy(miner: Any, star_id: int) -> Tuple[Any | None, Any |
     return _LC(pts, refs, used_filter), used_filter
 
 def _collect_via_lemondb_path(db_path: str, star_id: int) -> Tuple[Any | None, Any | None]:
-    """Raw .LEMONdB fallback using your database helper."""
     try:
         from . import database  # type: ignore
     except Exception:
@@ -314,7 +291,7 @@ def _collect_via_lemondb_path(db_path: str, star_id: int) -> Tuple[Any | None, A
     except Exception:
         return None, None
 
-# ------------- UI widgets -------------
+# ---------- UI widgets ----------
 class LightCurveView(Gtk.Box):
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -342,7 +319,6 @@ class LightCurveView(Gtk.Box):
             except Exception:
                 self._canvas = None; self._toolbar = None
 
-        # Fallback image holder
         self._picture = Gtk.Picture.new()
         self._picture.set_hexpand(True); self._picture.set_vexpand(True)
         self.append(self._picture)
@@ -399,54 +375,7 @@ class LightCurveView(Gtk.Box):
         except Exception as e:
             logger.warning("Plot error: %s", e)
 
-class _ValueLabelRow(Gtk.Grid):
-    def __init__(self, key: str, title: str):
-        super().__init__(column_spacing=8, row_spacing=2)
-        k_lbl = Gtk.Label(label=f"{title}:", xalign=1.0); k_lbl.add_css_class("monospace")
-        v_lbl = Gtk.Label(label="—", xalign=0.0);         v_lbl.add_css_class("monospace"); v_lbl.set_selectable(True)
-        self.attach(k_lbl, 0, 0, 1, 1)
-        self.attach(v_lbl, 1, 0, 1, 1)
-        self.value = v_lbl
-        self.key = key
-
-class StarInfoPanel(Gtk.Frame):
-    def __init__(self) -> None:
-        super().__init__(label="Star info")
-        self.set_hexpand(True); self.set_vexpand(True)
-        self.add_css_class("lemon-surface")
-
-        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
-        grid.set_margin_top(6); grid.set_margin_bottom(6)
-        grid.set_margin_start(6); grid.set_margin_end(6)
-        self.set_child(grid)
-
-        self._rows: dict[str, _ValueLabelRow] = {}
-        for i, (k, title) in enumerate((
-            ("id","ID"), ("ra","RA (hms)"), ("dec","Dec (dms)"),
-            ("imag","Mag"), ("filter","Filter"), ("npts","Curve points"),
-        )):
-            row = _ValueLabelRow(k, title); self._rows[k] = row
-            grid.attach(row, 0, i, 1, 1)
-
-        # actions
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_chart = Gtk.Button(label="Finding chart"); self.btn_chart.add_css_class("lemon-btn")
-        self.btn_simbad = Gtk.Button(label="Open in SIMBAD"); self.btn_simbad.add_css_class("lemon-btn")
-        box.append(self.btn_chart); box.append(self.btn_simbad)
-        grid.attach(box, 0, 6, 1, 1)
-
-        # mirrors
-        self.star_id: int = -1
-        self.ra_hms: str = ""
-        self.dec_dms: str = ""
-        self.field_name: str = ""
-
-    def set(self, key: str, value: str) -> None:
-        row = self._rows.get(key)
-        if row: row.value.set_label(value)
-
 class StringListFrame(Gtk.Frame):
-    """Simple ListView over Gio.ListStore(StringObject) with no selection."""
     def __init__(self, title: str):
         super().__init__(label=title)
         self.set_hexpand(True); self.set_vexpand(True)
@@ -459,14 +388,14 @@ class StringListFrame(Gtk.Frame):
             lbl = Gtk.Label(xalign=0.0); lbl.add_css_class("monospace"); lbl.set_selectable(True)
             li.set_child(lbl)
         def bind(_f, li: Gtk.ListItem):
-            it = li.get_item()
-            lbl: Gtk.Label = li.get_child()  # type: ignore[assignment]
+            it = li.get_item(); lbl: Gtk.Label = li.get_child()  # type: ignore[assignment]
             lbl.set_text(it.get_string() if it else "")  # type: ignore[attr-defined]
         factory.connect("setup", setup)
         factory.connect("bind", bind)
 
         sel = Gtk.NoSelection.new(self._store)
-        view = Gtk.ListView.new(sel, factory); view.add_css_class("lemon-surface")
+        view = Gtk.ListView.new(sel, factory)
+        view.add_css_class("lemon-surface")
 
         sc = Gtk.ScrolledWindow.new()
         sc.set_child(view)
@@ -480,63 +409,95 @@ class StringListFrame(Gtk.Frame):
         for line in lines:
             self._store.append(Gtk.StringObject.new(line))
 
-# ------------- Star details window -------------
+class StarInfoPanel(Gtk.Frame):
+    def __init__(self) -> None:
+        super().__init__(label="Star info")
+        self.set_hexpand(True); self.set_vexpand(True)
+        self.add_css_class("lemon-surface")
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        grid.set_margin_top(6); grid.set_margin_bottom(6)
+        grid.set_margin_start(6); grid.set_margin_end(6)
+        self.set_child(grid)
+
+        self._labels: dict[str, Gtk.Label] = {}
+        for i, (k, txt) in enumerate((
+            ("id","ID"), ("ra","RA (hms)"), ("dec","Dec (dms)"),
+            ("imag","Mag"), ("filter","Filter"), ("npts","Curve points"),
+        )):
+            k_lbl = Gtk.Label(label=f"{txt}:", xalign=1.0); k_lbl.add_css_class("monospace")
+            v_lbl = Gtk.Label(label="—", xalign=0.0);       v_lbl.add_css_class("monospace"); v_lbl.set_selectable(True)
+            grid.attach(k_lbl, 0, i, 1, 1)
+            grid.attach(v_lbl, 1, i, 1, 1)
+            self._labels[k] = v_lbl
+
+        # Action buttons
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.btn_chart  = Gtk.Button(label="Finding chart")
+        self.btn_simbad = Gtk.Button(label="Open in SIMBAD")
+        box.append(self.btn_chart); box.append(self.btn_simbad)
+        grid.attach(box, 0, 6, 2, 1)
+
+        # Mirrors for actions
+        self.star_id: int = -1
+        self.ra_hms: str = ""
+        self.dec_dms: str = ""
+        self.field_name: str = ""
+
+    def set(self, key: str, value: str) -> None:
+        lbl = self._labels.get(key)
+        if lbl: lbl.set_label(value)
+
+# ---------- main window ----------
 class StarDetailsWindow(Gtk.Window):
     """
-    Flexible constructor:
+    Accepts legacy/new patterns:
+      StarDetailsWindow(parent, data=<dict>)
+      StarDetailsWindow(parent, row=<row>, miner=?)
+      StarDetailsWindow(parent, row, miner)
 
-    New style:
-        StarDetailsWindow(parent, row, miner)
-
-    Legacy style:
-        StarDetailsWindow(parent, data=<dict>)  # works too
-        StarDetailsWindow(parent, row=<row>, miner=?)
-
-    The window loads curve/filter/refs via Miner → SQLAlchemy → .LEMONdB.
+    Also provides: set_star_data(data, reference_rows=None, point_rows=None)
+    so the caller (your window) can push precomputed lists.  :contentReference[oaicite:1]{index=1}
     """
     def __init__(self, parent: Gtk.Window,
                  row_or_data: Optional[Union[Any, dict]] = None,
-                 miner: Any = None,
+                 miner: LEMONdBMiner = None,
                  **kwargs) -> None:
         _install_theme_css()
 
-        # Support legacy kwargs
-        data = kwargs.pop("data", None)
-        row  = kwargs.pop("row", None)
+        row_kw = kwargs.pop("row", None)
+        data_kw = kwargs.pop("data", None)
 
-        # Normalize inputs
-        if data is None and isinstance(row_or_data, dict):
-            data = row_or_data
-            row = None
-        elif row is None and row_or_data is not None and not isinstance(row_or_data, dict):
+        if row_kw is not None:
+            row = row_kw
+        elif row_or_data is not None and not isinstance(row_or_data, dict):
             row = row_or_data
+        else:
+            row = None
 
-        # Discover miner if not passed
-        if miner is None:
-            miner = kwargs.pop("miner", None)
-        if miner is None:
-            miner = getattr(parent, "miner", None) or getattr(parent, "_miner", None)
+        if data_kw is not None:
+            data = data_kw
+        elif isinstance(row_or_data, dict):
+            data = row_or_data
+        else:
+            data = None
 
-        # Derive title early
+
+        # Title from data/row
         sid = None
         if row is not None:
-            try:
-                sid = int(getattr(row.props, "id", -1))
-            except Exception:
-                sid = None
+            try: sid = int(getattr(row.props, "id", -1))
+            except Exception: sid = None
         if sid is None and isinstance(data, dict):
-            try:
-                sid = int(data.get("id"))
-            except Exception:
-                sid = None
+            try: sid = int(data.get("id"))
+            except Exception: sid = None
 
         super().__init__(transient_for=parent, modal=True,
                          title=(f"Star {sid}" if isinstance(sid, int) and sid >= 0 else "Star details"))
         self.set_hide_on_close(True)
 
-        # Persist geometry via config (optional)
         try:
-            w = int(cfg.get("star_window", "width")); h = int(cfg.get("star_window", "height"))  # type: ignore[attr-defined]
+            w = int(cfg.get("star_window","width")); h = int(cfg.get("star_window","height"))  # type: ignore[attr-defined]
         except Exception:
             w, h = 1024, 680
         self.set_default_size(w, h)
@@ -545,80 +506,84 @@ class StarDetailsWindow(Gtk.Window):
         except Exception:
             pass
 
-        # Store
         self._parent = parent
         self._miner  = miner
         self._row    = row
         self._data   = data or {}
 
-        # Layout: Paned (top: plot + info, bottom: refs + points)
+        # Layout
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         root.set_margin_top(8); root.set_margin_bottom(8)
         root.set_margin_start(8); root.set_margin_end(8)
         root.add_css_class("lemon-surface")
         self.set_child(root)
 
-        self.vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        self.vpaned.set_wide_handle(True)
-        self.vpaned.set_resize_start_child(True)
-        self.vpaned.set_resize_end_child(True)
+        self.vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL); self.vpaned.set_resize_start_child(True); self.vpaned.set_resize_end_child(True); self.vpaned.set_wide_handle(True)
         root.append(self.vpaned)
 
-        self.top_paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        for p in (self.top_paned,):
-            p.set_wide_handle(True); p.set_resize_start_child(True); p.set_resize_end_child(True)
-            p.set_shrink_start_child(False); p.set_shrink_end_child(False)
-            p.set_hexpand(True); p.set_vexpand(True)
+        self.top_paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL); self.top_paned.set_resize_start_child(True); self.top_paned.set_resize_end_child(True); self.top_paned.set_wide_handle(True)
         self.vpaned.set_start_child(self.top_paned)
 
-        self.bottom_paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        for p in (self.bottom_paned,):
-            p.set_wide_handle(True); p.set_resize_start_child(True); p.set_resize_end_child(True)
-            p.set_shrink_start_child(False); p.set_shrink_end_child(False)
-            p.set_hexpand(True); p.set_vexpand(True)
+        self.bottom_paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL); self.bottom_paned.set_resize_start_child(True); self.bottom_paned.set_resize_end_child(True); self.bottom_paned.set_wide_handle(True)
         self.vpaned.set_end_child(self.bottom_paned)
 
-        # Top: Plot + Info
+        # Top: plot + info
         self.plot = LightCurveView()
-        sc_plot = Gtk.ScrolledWindow.new(); sc_plot.set_child(self.plot)
-        sc_plot.set_hexpand(True); sc_plot.set_vexpand(True); sc_plot.add_css_class("lemon-surface")
+        sc_plot = Gtk.ScrolledWindow.new(); sc_plot.set_child(self.plot); sc_plot.set_hexpand(True); sc_plot.set_vexpand(True); sc_plot.add_css_class("lemon-surface")
         self.top_paned.set_start_child(sc_plot)
 
         self.info = StarInfoPanel()
-        sc_info = Gtk.ScrolledWindow.new(); sc_info.set_child(self.info)
-        sc_info.set_hexpand(True); sc_info.set_vexpand(True); sc_info.add_css_class("lemon-surface")
+        sc_info = Gtk.ScrolledWindow.new(); sc_info.set_child(self.info); sc_info.set_hexpand(True); sc_info.set_vexpand(True); sc_info.add_css_class("lemon-surface")
         self.top_paned.set_end_child(sc_info)
 
-        # Bottom: Reference stars + Curve points
-        self.refs  = StringListFrame("Reference stars")
+        # Bottom: refs + points
+        self.refs   = StringListFrame("Reference stars")
         self.points = StringListFrame("Curve points")
         self.bottom_paned.set_start_child(self.refs)
         self.bottom_paned.set_end_child(self.points)
 
-        # Populate static labels before heavy DB work
+        # Static header from provided dict/row (fast feedback)
         self._populate_static_header()
 
         # Wire actions
         self.info.btn_chart.connect("clicked", self._on_open_chart)
         self.info.btn_simbad.connect("clicked", self._on_open_simbad)
 
-        # Load dynamic data after idle (lets main window finish selection work)
+        # Ratios
+        self._ratio_top = _cfg_getfloat("star_window","ratio_top",0.60)
+        self._ratio_plot = _cfg_getfloat("star_window","ratio_plot",0.60)
+        self._ratio_bottom_left = _cfg_getfloat("star_window","ratio_bottom_left",0.50)
+        self.connect("show", lambda *_: GLib.idle_add(self._apply_ratios))
+
+        # Load dynamic data (miner → SQLAlchemy → .LEMONdB)
         GLib.idle_add(lambda: (self._load_dynamic() or False))
 
-        # Optional split ratios from config
-        self._ratio_top = _cfg_getfloat("star_window", "ratio_top", 0.60)
-        self._ratio_plot = _cfg_getfloat("star_window", "ratio_plot", 0.60)
-        self._ratio_bottom_left = _cfg_getfloat("star_window", "ratio_bottom_left", 0.50)
-        self.connect("show", lambda *_: GLib.idle_add(self._apply_ratios))
+    # ----- external API expected by window.py -----
+    def set_star_data(self, data: dict,
+                      reference_rows: Optional[List[str]] = None,
+                      point_rows: Optional[List[Tuple[str, str]]] = None) -> None:
+        """
+        Called by the main window right after construction to push a prebuilt payload.
+        We use it to immediately update labels/lists; dynamic loading will still refine.
+        """
         try:
-            self.add_tick_callback(lambda *_: (self._apply_ratios() or False))
+            self._data.update(data or {})
         except Exception:
-            pass
-        self.vpaned.connect("notify::position", self._on_vpaned_moved)
-        self.top_paned.connect("notify::position", self._on_top_paned_moved)
-        self.bottom_paned.connect("notify::position", self._on_bottom_paned_moved)
+            self._data = dict(data or {})
+        self._populate_static_header()
 
-    # ---------- Split ratio handling ----------
+        # Refs
+        if reference_rows:
+            self.refs.set_lines([str(x) for x in reference_rows])
+
+        # Points (string pairs -> show as-is; plotting waits for numeric dynamic load)
+        if point_rows:
+            lines: List[str] = []
+            for i, (x, y) in enumerate(point_rows, 1):
+                lines.append(f"{i:03d}  {str(x)}    mag={str(y)}")
+            self.points.set_lines(lines)
+
+    # ----- UI proportions -----
     def _apply_ratios(self) -> bool:
         try:
             vh = self.vpaned.get_allocated_height()
@@ -630,75 +595,59 @@ class StarDetailsWindow(Gtk.Window):
         except Exception:
             pass
         return False
-    def _on_vpaned_moved(self, *_a) -> None:
-        vh = self.vpaned.get_allocated_height()
-        if vh > 0: self._ratio_top = self.vpaned.get_position() / float(vh)
-    def _on_top_paned_moved(self, *_a) -> None:
-        tw = self.top_paned.get_allocated_width()
-        if tw > 0: self._ratio_plot = self.top_paned.get_position() / float(tw)
-    def _on_bottom_paned_moved(self, *_a) -> None:
-        bw = self.bottom_paned.get_allocated_width()
-        if bw > 0: self._ratio_bottom_left = self.bottom_paned.get_position() / float(bw)
 
-    # ---------- Populate static header ----------
+    # ----- labels from static info -----
     def _populate_static_header(self) -> None:
-        sid = None; ra_deg = None; dec_deg = None; imag = None; pfilter = None
+        sid = self._data.get("id")
+        ra_deg = self._data.get("ra_deg")
+        dec_deg = self._data.get("dec_deg")
+        imag = self._data.get("mag")
+        pfilter = self._data.get("filt")
 
-        if self._row is not None:
-            try:
-                sid = int(getattr(self._row.props, "id", -1))
-            except Exception:
-                sid = None
+        if sid is None and self._row is not None:
+            try: sid = int(getattr(self._row.props, "id", -1))
+            except Exception: sid = None
+        if (ra_deg is None or dec_deg is None) and self._row is not None:
             try:
                 ra_deg = float(getattr(self._row.props, "ra", 0.0))
                 dec_deg = float(getattr(self._row.props, "dec", 0.0))
             except Exception:
                 pass
-            imag = getattr(self._row.props, "imag", None)
+            imag = getattr(self._row.props, "imag", imag)
 
-        if isinstance(self._data, dict):
-            sid     = self._data.get("id", sid)
-            ra_deg  = self._data.get("ra_deg", ra_deg)
-            dec_deg = self._data.get("dec_deg", dec_deg)
-            imag    = self._data.get("mag", imag)
-            pfilter = self._data.get("filt", pfilter)
+        self.info.star_id = int(sid) if isinstance(sid, (int, float)) else -1
 
-        self.info.star_id = int(sid) if sid is not None else -1
-        if isinstance(ra_deg, (int, float)) and isinstance(dec_deg, (int, float)):
-            self.info.ra_hms  = _hms_from_deg(float(ra_deg))
-            self.info.dec_dms = _dms_from_deg(float(dec_deg))
-        else:
-            # As strings if provided in data
-            self.info.ra_hms  = (self._data.get("ra_str") if isinstance(self._data, dict) else "") or ""
-            self.info.dec_dms = (self._data.get("dec_str") if isinstance(self._data, dict) else "") or ""
+        ra_str  = self._data.get("ra_str")  or (_hms_from_deg(float(ra_deg)) if isinstance(ra_deg,(int,float)) else "")
+        dec_str = self._data.get("dec_str") or (_dms_from_deg(float(dec_deg)) if isinstance(dec_deg,(int,float)) else "")
+        self.info.ra_hms  = ra_str
+        self.info.dec_dms = dec_str
+        self.info.field_name = self._data.get("field_name", "") or str(_find_db_path(self._miner, self._parent) or "")
 
-        # Field (optional)
-        self.info.field_name = getattr(self._miner, "field_name", "") or str(_find_db_path(self._miner, self._parent) or "")
-
-        # Labels
         self.info.set("id", str(self.info.star_id if self.info.star_id >= 0 else "—"))
-        self.info.set("ra", self.info.ra_hms or "—")
-        self.info.set("dec", self.info.dec_dms or "—")
+        self.info.set("ra", ra_str or "—")
+        self.info.set("dec", dec_str or "—")
         self.info.set("imag", "" if (imag is None or (isinstance(imag,float) and math.isnan(imag))) else f"{float(imag):.3f}")
         self.info.set("filter", str(pfilter) if pfilter is not None else "—")
-        self.info.set("npts", "—")
+        self.info.set("npts", str(self._data.get("n_points")) if self._data.get("n_points") is not None else "—")
 
-    # ---------- Heavy load: curve, refs, filter ----------
+    # ----- dynamic: curve, refs, filter -----
     def _load_dynamic(self) -> bool:
         sid = self.info.star_id
+        if not isinstance(sid, int) or sid < 0:
+            return False
         miner = self._miner
 
         curve = None; used_pf = None
 
-        # (1) Miner APIs
-        if miner is not None and isinstance(sid, int) and sid >= 0:
+        # 1) Miner APIs
+        if miner is not None:
             try:
                 curve, used_pf = _collect_best_light_curve(miner, sid)
             except Exception:
                 pass
 
-        # (2) SQLAlchemy (miner.sa_session)
-        if not _curve_to_points(curve) and miner is not None and isinstance(sid, int) and sid >= 0:
+        # 2) SQLAlchemy (miner.sa_session)
+        if not _curve_to_points(curve) and miner is not None:
             try:
                 alt_curve, alt_pf = _collect_via_sqlalchemy(miner, sid)
                 if _curve_to_points(alt_curve):
@@ -706,8 +655,8 @@ class StarDetailsWindow(Gtk.Window):
             except Exception:
                 pass
 
-        # (3) Raw .LEMONdB
-        if not _curve_to_points(curve) and isinstance(sid, int) and sid >= 0:
+        # 3) Raw .LEMONdB
+        if not _curve_to_points(curve):
             db_path = _find_db_path(miner, self._parent) if miner is not None else getattr(self._parent, "_db_path", None)
             if db_path:
                 try:
@@ -717,16 +666,15 @@ class StarDetailsWindow(Gtk.Window):
                 except Exception:
                     pass
 
-        # Populate UI
+        # Lists
         pts = _curve_to_points(curve)
-        # Curve points list
         lines_pts: List[str] = []
         for i, (t, mag, snr) in enumerate(pts, 1):
             snr_txt = "" if snr is None else f"{snr:.1f}"
             lines_pts.append(f"{i:03d}  {_fmt_time(t)}    mag={_format_mag(mag)}    SNR={snr_txt}")
-        self.points.set_lines(lines_pts)
+        if lines_pts:
+            self.points.set_lines(lines_pts)
 
-        # Reference stars
         lines_refs: List[str] = []
         w = _curve_cstars_with_weights(curve)
         if w:
@@ -749,38 +697,33 @@ class StarDetailsWindow(Gtk.Window):
             if ids:
                 for sidr in ids:
                     lines_refs.append(f"{int(sidr):6d}")
-        self.refs.set_lines(lines_refs)
+        if lines_refs:
+            self.refs.set_lines(lines_refs)
 
-        # Plot
+        # Plot + labels
         try:
             self.plot.plot_curve(curve, star_id=sid, pfilter=used_pf)
         except Exception as e:
             logger.warning("Plotting failed: %s", e)
 
-        # Labels update
         self.info.set("npts", str(len(pts)))
         if used_pf is not None:
             self.info.set("filter", str(used_pf))
-
         return False
 
-    # ---------- Actions ----------
+    # ----- actions -----
     def _on_open_chart(self, _btn: Gtk.Button) -> None:
         try:
             from . import chart  # type: ignore
-            chart.show_finding_chart(
-                self,
-                miner=self._miner,
-                star_id=self.info.star_id,
-                field_name=self.info.field_name,
-            )
+            chart.show_finding_chart(self, miner=self._miner,
+                                     star_id=self.info.star_id,
+                                     field_name=self.info.field_name)
         except Exception as e:
             print(f"Finding Chart error: {e}", file=sys.stderr)
 
     def _on_open_simbad(self, _btn: Gtk.Button) -> None:
         try:
             from . import simbad  # type: ignore
-            # SIMBAD likes 00h00m00s style; we just replace delimiters minimally
             ra = self.info.ra_hms.replace(":", "h", 1)
             ra = ra.replace(":", "m", 1) + "s" if "m" in ra else self.info.ra_hms
             dec = self.info.dec_dms.replace(":", "d", 1)

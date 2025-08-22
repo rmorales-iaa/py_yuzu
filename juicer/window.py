@@ -486,7 +486,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             refs = self._fetch_refs_for(int(getattr(row.props, "id", -1)))
             pts = self._fetch_points_for(int(getattr(row.props, "id", -1)))
 
-            self._star_win = StarDetailsWindow(self, data=data)
+            self._star_win = StarDetailsWindow(self, row, miner=self._miner, data=row)
             # Push refs/points (if we found any)
             try:
                 self._star_win.set_star_data(data, reference_rows=refs or None, point_rows=pts or None)
