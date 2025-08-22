@@ -58,7 +58,6 @@ def _load_main_builder() -> Gtk.Builder:
                 return b
             except Exception as e:
                 logger.warning("Failed loading legacy main.glade at %s: %s", p, e)
-    logger.warning("Using empty builder; no main.ui found.")
     return Gtk.Builder()
 
 

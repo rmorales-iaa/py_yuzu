@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from __future__ import division
-
 from pathlib import Path
 
 # Copyright (c) 2012 Victor Terron. All rights reserved.
@@ -396,7 +394,7 @@ key_group.add_option("--airmk", action="store", type=str, dest="airmassk",
 key_group.add_option("--uik", action="store", type=str, dest="uncimgk",
                      default=keywords.uncimgk, help=keywords.desc["uncimgk"])
 
-# Positionals (keep optparse feel: we’ll split them ourselves)
+# Positionals (keep optparse feel: we?ll split them ourselves)
 parser.add_argument("paths", nargs="+", help="SOURCES_IMG INPUT_IMGS... OUTPUT_DB")
 customparser.clear_metavars(parser)
 
@@ -533,7 +531,7 @@ def main(arguments: list[str] | None = None) -> int:
     print()  # newline
 
     print(f"{style.prefix}{len(files.keys())} different photometric filters were detected:")
-    for pfilter, images in sorted(files.items()):
+    for pfilter, images in sorted(list(files.items())):
         percentage = (len(images) / float(len(files))) * 100.0 if len(files) else 0.0
         print(f"{style.prefix} {pfilter}: {len(images)} files ({percentage:.2f} %)")
 
@@ -543,14 +541,14 @@ def main(arguments: list[str] | None = None) -> int:
 
     get_dict = lambda: collections.defaultdict(list)
     dates_counter: dict[float, dict[passband.Passband, list[str]]] = collections.defaultdict(get_dict)
-    for pfilter, images in files.items():
+    for pfilter, images in list(files.items()):
         for img_path in images:
             date = img_dates[img_path]
             dates_counter[date][pfilter].append(img_path)
 
     discarded = 0
     for date, date_images in dates_counter.items():
-        for pfilter, images in date_images.items():
+        for pfilter, images in list(date_images.items()):
             if len(images) > 1:
                 if not discarded:
                     print()
@@ -663,9 +661,9 @@ def main(arguments: list[str] | None = None) -> int:
 
     # Print center coords
     h, m, s = DD_to_HMS(sources_img_ra)
-    print(f"{style.prefix}α = {sources_img_ra:11.7f} ({h:02d} {m:02d} {s:05.2f})")
+    print(f"{style.prefix}? = {sources_img_ra:11.7f} ({h:02d} {m:02d} {s:05.2f})")
     d, m2, s2 = DD_to_DMS(sources_img_dec)
-    print(f"{style.prefix}δ = {sources_img_dec:11.7f} ({d:+02d} {m2:02d} {s2:05.2f})")
+    print(f"{style.prefix}? = {sources_img_dec:11.7f} ({d:+02d} {m2:02d} {s2:05.2f})")
 
     # Coordinates list: from file or detections
     if options.coordinates:
@@ -831,7 +829,7 @@ def main(arguments: list[str] | None = None) -> int:
         output_db.simage = simage
         output_db.commit()
 
-        for pfilter, images in sorted(files.items()):
+        for pfilter, images in sorted(list(files.items())):
             print(style.prefix)
             print(f"{style.prefix}Let's do photometry on the {len(images)} images taken in the {pfilter} filter.")
 
@@ -1012,6 +1010,7 @@ def main(arguments: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())
 
 logger = logging.getLogger(__name__)
