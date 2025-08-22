@@ -42,3 +42,43 @@ height = 867
 [parallel]
 ncores = 16
 
+[chart]
+invert_mag_axis = false
+snr_bad_threshold = 5.0
+point_size = 18
+error_linewidth = 1.0
+error_capsize = 2.0
+bad_marker_size = 36
+
+[star_info]
+key_color = #ffa500
+simbad_button_variant = ghost
+save_button_variant = ghost
+
+
+
+[reference_table]
+header_bg = #b85c00     ; dark orange for the "id | weight | sigma" header
+header_fg = #ffffff     ; header text color
+grid_color = #c9a000    ; dark yellow cell dividers
+row_height = 26         ; row min height (px)
+
+
+[curve_points_table]
+header_bg = #b85c00        ; dark orange header
+header_fg = #ffffff        ; header text
+grid_color = #c9a000       ; dark yellow cell dividers
+row_height = 26            ; px
+date_format = %Y-%m-%d %H:%M:%S
+mag_decimals = 4
+snr_decimals = 1
+
+
+[export]
+create_subdir = true
+subdir_template = star_{id}
+refs_filename = reference_stars.csv
+points_filename = data_points.csv
+plot_filename = light_curve.png
+plot_dpi = 150
+last_dir =

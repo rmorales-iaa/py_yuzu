@@ -1,3 +1,4 @@
+# juicer/window.py
 from __future__ import annotations
 import importlib
 import importlib.util
@@ -15,6 +16,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GObject", "2.0")
 gi.require_version("Graphene", "1.0")
+gi.require_version("Pango", "1.0")
 from gi.repository import Gtk, Gio, GLib, Gdk, GObject, Pango, Graphene  # type: ignore
 
 # Optional config (rebound via --config)
@@ -33,9 +35,29 @@ for p in (str(PKG_DIR), str(ROOT_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# Models + details window
+# Models + details window (both programmatic, no .ui)
 from .models import StarRow
-from .star_window import StarDetailsWindow
+from .star_details_window import StarDetailsWindow
+
+
+# ---------------- GLib helper ----------------
+def _remove_source_if_alive(sid: int) -> bool:
+    try:
+        if not isinstance(sid, int) or sid <= 0:
+            return False
+        ctx = GLib.MainContext.default()
+        if ctx is None:
+            return GLib.Source.remove(sid)
+        src = ctx.find_source_by_id(sid)
+        if src is None:
+            return False
+        src.destroy()
+        return True
+    except Exception:
+        try:
+            return GLib.Source.remove(sid)
+        except Exception:
+            return False
 
 
 # ---------------- Config helpers ----------------
@@ -98,7 +120,7 @@ def _dms_from_deg(dec_deg: float) -> str:
 
 # ---------------- Main Window ----------------
 class LEMONJuicerWindow(Gtk.ApplicationWindow):
-    """GTK4 window with a ColumnView listing stars from the DB."""
+    """GTK4 window with a ColumnView listing stars from the DB (no .ui files)."""
 
     def __init__(self, app: Gtk.Application, title_suffix: str = "",
                  autoselect_radec: Optional[tuple[float, float]] = None):
@@ -125,7 +147,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # Scrolling helpers
         self._row_height_px: Optional[int] = None
         self._scroller: Optional[Gtk.ScrolledWindow] = None
-        self._row_widgets: dict[int, Gtk.Widget] = {}     # sorted index -> row widget (box)
+        self._row_widgets: dict[int, Gtk.Widget] = {}     # sorted index -> row widget
         self._inner_listview: Optional[Gtk.ListView] = None
 
         # ---- Theme from [theme] ----
@@ -138,7 +160,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         _DIV_W       = _cfg_get_int("theme", "divider_width_px", 1)
         _SEL_BG      = _cfg_get("theme", "row_selected", "#375a7f")
         _SEL_FG      = _ACCENT
-
         _HEADER_BG        = "#1f4aa8"
         _HEADER_BG_HOVER  = "#2456bf"
         _HEADER_BG_ACTIVE = "#1a3e8f"
@@ -146,65 +167,38 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # ---------- CSS ----------
         provider = Gtk.CssProvider()
         css = f"""
-        * {{
-          font-family: '{_FONT_NAME}';
-          font-size: {_FONT_SIZEPT}pt;
-        }}
+        * {{ font-family: '{_FONT_NAME}'; font-size: {_FONT_SIZEPT}pt; }}
         columnview.lemon-dark listview {{ background-color: {_BG}; }}
         columnview.lemon-dark label {{ color: {_FG}; }}
-
-        /* Strong selection override */
         columnview.lemon-dark listview row:selected,
-        columnview.lemon-dark listview row:selected:focus,
-        columnview.lemon-dark listitem:selected,
-        columnview.lemon-dark listitem:selected:focus {{
-          background-color: {_SEL_BG};
-        }}
+        columnview.lemon-dark listitem:selected {{ background-color: {_SEL_BG}; }}
         columnview.lemon-dark listview row:selected label,
-        columnview.lemon-dark listitem:selected label {{
-          color: {_SEL_FG};
-        }}
-
-        /* Per-cell column divider */
+        columnview.lemon-dark listitem:selected label {{ color: {_SEL_FG}; }}
         .lemon-vsep {{ background-color: {_DIVIDER}; margin-left: 6px; }}
         .lemon-last .lemon-vsep {{ background-color: transparent; margin-left: 0; }}
-
-        /* Header */
-        columnview.lemon-dark > header,
-        columnview.lemon-dark > header > * {{
-          background-color: {_HEADER_BG};
-          color: #ffffff;
+        columnview.lemon-dark > header, columnview.lemon-dark > header > * {{
+          background-color: {_HEADER_BG}; color: #fff;
         }}
         columnview.lemon-dark > header button {{
-          background-color: {_HEADER_BG};
-          color: #ffffff;
-          font-weight: 600;
-          padding: 6px 8px;
-          border-right: 1px solid {_DIVIDER};
-          border-top: 0;
-          border-bottom: 0;
+          background-color: {_HEADER_BG}; color: #fff; font-weight: 600;
+          padding: 6px 8px; border-right: 1px solid {_DIVIDER}; border-top: 0; border-bottom: 0;
         }}
-        columnview.lemon-dark > header button:last-child {{ border-right: none; }}
         columnview.lemon-dark > header button:hover {{ background-color: {_HEADER_BG_HOVER}; }}
         columnview.lemon-dark > header button:active,
         columnview.lemon-dark > header button:checked {{ background-color: {_HEADER_BG_ACTIVE}; }}
-
-        /* Status bar */
         .lemon-statusbar {{ background-color: {_BG}; padding: 6px 10px; }}
         .lemon-statusbar * {{ color: {_ACCENT}; }}
         """
         provider.load_from_data(css.encode("utf-8"))
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
-            provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_USER,
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
         )
 
         # ---------- HeaderBar ----------
         hb = Gtk.HeaderBar.new()
         self.set_titlebar(hb)
         open_btn = Gtk.Button.new_from_icon_name("document-open-symbolic")
-        open_btn.set_tooltip_text("Open LEMON database?")
+        open_btn.set_tooltip_text("Open LEMON database…")
         open_btn.connect("clicked", self._on_open_clicked)
         hb.pack_start(open_btn)
 
@@ -217,10 +211,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         self._rows = Gio.ListStore.new(StarRow)
         self._sort_model = Gtk.SortListModel.new(model=self._rows, sorter=None)
         self._sel = Gtk.SingleSelection.new(self._sort_model)
-        try:
-            self._sel.set_autoselect(True)
-        except Exception:
-            pass
+        try: self._sel.set_autoselect(True)
+        except Exception: pass
         self._sel.set_can_unselect(False)
         self._sel.connect("selection-changed", self._on_selection_changed)
 
@@ -228,16 +220,14 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         self._view = Gtk.ColumnView.new(self._sel)
         self._view.add_css_class("lemon-dark")
         self._view.set_hexpand(True); self._view.set_vexpand(True)
-        self._view.connect("activate", self._on_view_activate)  # double-click / Enter opens
+        self._view.connect("activate", self._on_view_activate)  # double-click / Enter
 
-        # When the view is mapped or size changes, retry reveal the *current* selection
+        # Reveal retries when mapped / resized
         self._view.connect("map", lambda *_: GLib.idle_add(self._reveal_current_selection))
         try:
             self._view.connect("size-allocate", lambda *_a: GLib.idle_add(self._reveal_current_selection))
         except Exception:
             pass
-
-        # Re-select remembered ID if sort changes
         self._sort_model.connect("items-changed", lambda *_: self._request_reselect())
         try:
             sorter = self._view.get_sorter()
@@ -265,21 +255,18 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
             def setup(_f, li: Gtk.ListItem):
                 box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-                if is_last:
-                    box.add_css_class("lemon-last")
+                if is_last: box.add_css_class("lemon-last")
                 lbl = Gtk.Label(xalign=xalign)
                 lbl.set_single_line_mode(True)
                 lbl.set_ellipsize(Pango.EllipsizeMode.END)
-                if monospace:
-                    lbl.add_css_class("monospace")
+                if monospace: lbl.add_css_class("monospace")
                 lbl.set_hexpand(True)
                 box.append(lbl)
                 sep = Gtk.Box()
                 sep.add_css_class("lemon-vsep")
                 sep.set_hexpand(False); sep.set_vexpand(True)
-                sep.set_size_request(max(1, _DIV_W), -1)
-                if is_last:
-                    sep.set_visible(False)
+                sep.set_size_request(max(1, _CFG_DIV_W()), -1)
+                if is_last: sep.set_visible(False)
                 box.append(sep)
                 li.set_child(box)
 
@@ -291,7 +278,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 if isinstance(lbl, Gtk.Label):
                     lbl.set_text(txt)
 
-                # Track row widget for bounds-based scrolling
+                # Track row widget
                 try:
                     pos = li.get_position()
                     if isinstance(pos, int) and pos >= 0:
@@ -299,11 +286,11 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 except Exception:
                     pass
 
-                # Measure row height once
+                # First height measurement
                 try:
                     alloc = box.get_allocation()
                     h = getattr(alloc, "height", 0) or 0
-                    if h > 0 and getattr(self, "_row_height_px", None) is None:
+                    if h > 0 and self._row_height_px is None:
                         self._row_height_px = int(h)
                 except Exception:
                     pass
@@ -328,7 +315,13 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 col.set_fixed_width(width_px)
             return col
 
-        # ---------- Columns ----------
+        def _CFG_DIV_W() -> int:
+            try:
+                return _cfg_get_int("theme", "divider_width_px", 1)
+            except Exception:
+                return 1
+
+        # Columns
         col_id = make_text_column(
             "ID",
             lambda r: "" if r is None else f"{int(getattr(r.props, 'id', 0))}",
@@ -358,11 +351,10 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             width_px=_W_MAG, xalign=1.0, monospace=True, expand=False, is_last=True,
         ); self._view.append_column(col_mag)
 
-        # ---------- Sorters ----------
+        # Sorters
         def numeric_sorter(prop_name: str) -> Gtk.NumericSorter:
             expr = Gtk.PropertyExpression.new(StarRow, None, prop_name)
-            s = Gtk.NumericSorter.new(expr)
-            s.set_sort_order(Gtk.SortType.ASCENDING)
+            s = Gtk.NumericSorter.new(expr); s.set_sort_order(Gtk.SortType.ASCENDING)
             return s
 
         def multi(primary: str, secondary: str) -> Gtk.MultiSorter:
@@ -375,10 +367,9 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         col_dec.set_sorter(multi("dec", "ra"))
         col_mag.set_sorter(multi("imag", "id"))
         col_id.set_sorter(multi("id", "ra"))
-
         self._sort_model.set_sorter(self._view.get_sorter())
 
-        # ---------- Scroller ----------
+        # Scroller
         scroller = Gtk.ScrolledWindow.new()
         scroller.add_css_class("lemon-scroller")
         scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -387,7 +378,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         root.append(scroller)
         self._scroller = scroller
 
-        # ---------- Status ----------
+        # Status
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         status_bar.add_css_class("lemon-statusbar")
         status_bar.set_hexpand(True)
@@ -423,30 +414,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             pass
 
     # -------- Selection & activate --------
-    def _cancel_reveal_retries(self) -> None:
-        if not self._reveal_retry_ids:
-            return
-        for sid in self._reveal_retry_ids:
-            try:
-                GLib.source_remove(sid)
-            except Exception:
-                pass
-        self._reveal_retry_ids.clear()
-
-    def _queue_reveal_retries(self) -> None:
-        """Schedule a few retries that always recompute the CURRENT selection."""
-        self._cancel_reveal_retries()
-        self._reveal_retry_ids.append(GLib.idle_add(self._reveal_current_selection))
-        for delay in (80, 180, 360, 700, 1200):
-            self._reveal_retry_ids.append(GLib.timeout_add(delay, self._reveal_current_selection))
-        try:
-            def _tick_once(_w, _fc):
-                self._reveal_current_selection()
-                return False
-            self._view.add_tick_callback(_tick_once)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
     def _on_selection_changed(self, _model, _pos, _n_items):
         item: StarRow | None = self._sel.get_selected_item()
         if not item:
@@ -460,8 +427,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         imag = getattr(item.props, "imag", float("nan"))
         mag_txt = "" if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else f"{float(imag):.3f}"
         self._status.set_label(f"ID: {sid}  |  RA: {_hms_from_deg(ra)}  |  Dec: {_dms_from_deg(dec)}  |  Mag: {mag_txt}")
-
-        # Reveal *this* selection and only schedule retries that recompute the current pos
         self._queue_reveal_retries()
 
     def _on_view_activate(self, _view: Gtk.ColumnView, _pos: int):
@@ -469,31 +434,46 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         if item:
             self._open_star_window(item)
 
+    def _open_star_from_current_selection(self) -> bool:
+        item: StarRow | None = self._sel.get_selected_item()
+        if item:
+            self._open_star_window(item)
+        return False
+
     def _open_star_window(self, row: StarRow) -> None:
+        # Close previous
         try:
             if self._star_win is not None:
-                try:
-                    self._star_win.destroy()
-                except Exception:
-                    pass
+                try: self._star_win.destroy()
+                except Exception: pass
                 self._star_win = None
         except Exception:
             self._star_win = None
 
         try:
-            # Build payload directly from this row
-            data = self._row_to_data(row)
-            refs = self._fetch_refs_for(int(getattr(row.props, "id", -1)))
-            pts = self._fetch_points_for(int(getattr(row.props, "id", -1)))
+            # Build payload directly from this row (dict expected by StarDetailsWindow)
+            sid = int(getattr(row.props, "id", -1))
+            ra  = float(getattr(row.props, "ra", 0.0))
+            dec = float(getattr(row.props, "dec", 0.0))
+            imag = getattr(row.props, "imag", float("nan"))
 
-            self._star_win = StarDetailsWindow(self, row, miner=self._miner, data=row)
-            # Push refs/points (if we found any)
-            try:
-                self._star_win.set_star_data(data, reference_rows=refs or None, point_rows=pts or None)
-            except Exception:
-                pass
+            data = {
+                "id": sid,
+                "ra_deg": ra,
+                "dec_deg": dec,
+                "ra_str": _hms_from_deg(ra),
+                "dec_str": _dms_from_deg(dec),
+                "mag": None if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else float(imag),
+                "filt": None,
+                "n_points": None,
+                "field_name": getattr(self._miner, "field_name", "") or (Path(self._db_path).stem if self._db_path else ""),
+                "simbad_id": None,
+            }
 
+            # Create details window (no .ui), let it query SQLAlchemy itself
+            self._star_win = StarDetailsWindow(self, row_as_dict=data, miner=self._miner)
             self._star_win.present()
+
         except Exception as e:
             self._show_error(f"Could not open star window:\n{e}", title="Star Window Error")
 
@@ -540,9 +520,12 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"LEMON juicer ? {Path(db_path).name}")
+        self.set_title(f"LEMON juicer — {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
         self._populate_overview_from_miner(miner)
+
+        # If CLI passed --star …, ensure autoselect + AUTO-OPEN happens
+        self._ensure_autoselect_when_ready()
 
     # -------- Auto-select / reveal --------
     def _angsep_deg(self, ra1, dec1, ra2, dec2) -> float:
@@ -599,7 +582,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             return False
 
     def _reveal_current_selection(self) -> bool:
-        """Reveal the currently selected row, if any (recomputes index each time)."""
         try:
             pos = None
             try:
@@ -628,8 +610,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         return False
 
     def _reveal_sorted_position(self, pos: int) -> None:
-        """Bring row at `pos` into view ? immediate attempts only."""
-        # A) ColumnView API
         try:
             self._view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, None)  # type: ignore[attr-defined]
             try: self._view.grab_focus()
@@ -637,7 +617,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             return
         except Exception:
             pass
-        # B) ColumnView action
         try:
             self._view.activate_action("list.scroll-to-item", GLib.Variant('u', pos))
             try: self._view.grab_focus()
@@ -645,7 +624,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             return
         except Exception:
             pass
-        # C) Inner ListView action
         try:
             lv = self._find_inner_listview()
             if lv is not None:
@@ -655,14 +633,12 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 return
         except Exception:
             pass
-        # D) Widget bounds
         try:
             w = self._row_widgets.get(pos)
             if w is not None and self._scroll_to_widget_bounds(w):
                 return
         except Exception:
             pass
-        # E) Adjustment estimate
         try:
             if self._scroller:
                 vadj = self._scroller.get_vadjustment()
@@ -732,7 +708,6 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         self._selected_star_id = best_id
         self._queue_reveal_retries()
 
-        # Log picked star
         r = float(getattr(target_row.props, "ra", float("nan")))
         d = float(getattr(target_row.props, "dec", float("nan")))
         sep = self._angsep_deg(ra_deg, dec_deg, r, d)
@@ -740,32 +715,16 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                     int(getattr(target_row.props, "id", -1)),
                     _hms_from_deg(r), _dms_from_deg(d), sep * 3600000.0)
 
-        # One quick reassert if a resort immediately moved it
-        def _reassert(*_a):
-            it = self._sel.get_selected_item()
-            if not it or int(getattr(it.props, "id", -999)) != best_id:
-                try:
-                    self._sel.set_selected(target_idx)
-                    self._queue_reveal_retries()
-                    logger.info("Auto-select reasserted at %s", target_idx)
-                except Exception:
-                    pass
-            return False
-        GLib.idle_add(_reassert)
-
     def _do_autoselect_now(self) -> bool:
         if self._autoselect_done or not self._autoselect_radec:
             return False
         ra0, dec0 = self._autoselect_radec
-        try:
-            logger.info("Auto-select request: RA=%.6f deg  Dec=%.6f deg", ra0, dec0)
-        except Exception:
-            pass
+        logger.info("Auto-select request: RA=%.6f deg  Dec=%.6f deg", ra0, dec0)
         try:
             self._select_nearest_to(float(ra0), float(dec0))
-        except Exception as e:
-            logger.warning("Auto-select failed: %s", e)
         finally:
+            # After selection, auto-open the star details
+            GLib.idle_add(self._open_star_from_current_selection)
             self._autoselect_done = True
             self._autoselect_radec = None
         return False
@@ -776,16 +735,34 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         if self._sort_model.get_n_items() > 0:
             GLib.idle_add(self._do_autoselect_now)
             return
-        def on_items_changed(model, pos, removed, added):
+        def on_items_changed(model, _pos, _removed, _added):
             if model.get_n_items() > 0 and not self._autoselect_done:
                 GLib.idle_add(self._do_autoselect_now)
-            try:
-                model.disconnect(handler_id)
-            except Exception:
-                pass
+            try: model.disconnect(handler_id)
+            except Exception: pass
         handler_id = self._sort_model.connect("items-changed", on_items_changed)
 
     # -------- Debounced reselect by remembered ID --------
+    def _cancel_reveal_retries(self) -> None:
+        if not self._reveal_retry_ids:
+            return
+        for sid in list(self._reveal_retry_ids):
+            _remove_source_if_alive(sid)
+        self._reveal_retry_ids.clear()
+
+    def _queue_reveal_retries(self) -> None:
+        self._cancel_reveal_retries()
+        self._reveal_retry_ids.append(GLib.idle_add(self._reveal_current_selection))
+        for delay in (80, 180, 360, 700, 1200):
+            self._reveal_retry_ids.append(GLib.timeout_add(delay, self._reveal_current_selection))
+        try:
+            def _tick_once(_w, _fc):
+                self._reveal_current_selection()
+                return False
+            self._view.add_tick_callback(_tick_once)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     def _request_reselect(self) -> None:
         if self._reselect_idle_id is not None:
             return
@@ -827,10 +804,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                                 self._sel.set_selected(j)
                             except Exception:
                                 pass
-                        try:
-                            self._view.grab_focus()
-                        except Exception:
-                            pass
+                        try: self._view.grab_focus()
+                        except Exception: pass
                         self._queue_reveal_retries()
                         logger.info("Reselected remembered ID=%s at sorted index %s", sid, j)
                         return
@@ -914,17 +889,13 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         click = Gtk.GestureClick()
         click.set_button(3)
         click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        try:
-            click.set_exclusive(True)
-        except Exception:
-            pass
+        try: click.set_exclusive(True)
+        except Exception: pass
 
-        def on_pressed(gesture, n_press, x, y):
-            try:
-                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-            except Exception:
-                pass
-            _popup_at(x, y)
+        def on_pressed(gesture, _n_press, x, y):
+            try: gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            except Exception: pass
+            _popup_at(int(x), int(y))
 
         click.connect("pressed", on_pressed)
         self._status.add_controller(click)
@@ -945,23 +916,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         for star_id in getattr(miner, "star_ids", []):
             try:
                 x, y, ra, dec, *_rest, imag = miner.get_star(star_id)
-                try:
-                    row = StarRow(id=int(star_id), ra=float(ra), dec=float(dec), imag=float(imag))
-                except Exception:
-                    row = StarRow()
-                    try:
-                        row.set_property("id", int(star_id))
-                        row.set_property("ra", float(ra))
-                        row.set_property("dec", float(dec))
-                        row.set_property("imag", float(imag))
-                    except Exception:
-                        try:
-                            row.props.id = int(star_id)
-                            row.props.ra = float(ra)
-                            row.props.dec = float(dec)
-                            row.props.imag = float(imag)
-                        except Exception:
-                            continue
+                row = StarRow(id=int(star_id), ra=float(ra), dec=float(dec), imag=float(imag))
                 self._rows.append(row)
                 n_added += 1
             except Exception:
@@ -969,152 +924,18 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         n_filters = len(getattr(miner, "pfilters", []))
         field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
-        self._set_status(f"Field: {field} ? Stars shown: {n_added} ? Filters: {n_filters}")
+        self._set_status(f"Field: {field} — Stars shown: {n_added} — Filters: {n_filters}")
 
-        # Initial autoselect (if requested)
-        self._ensure_autoselect_when_ready()
-
-    def _row_to_data(self, row: StarRow) -> dict:
-        """Convert a StarRow into the dict StarDetailsWindow expects."""
-        try:
-            sid = int(getattr(row.props, "id", -1))
-            ra = float(getattr(row.props, "ra", 0.0))
-            dec = float(getattr(row.props, "dec", 0.0))
-            imag = getattr(row.props, "imag", float("nan"))
-        except Exception:
-            sid, ra, dec, imag = -1, 0.0, 0.0, float("nan")
-
-        # Pretty strings for RA/Dec
-        ra_str = _hms_from_deg(ra)
-        dec_str = _dms_from_deg(dec)
-
-        # Field name from miner or file
-        field = getattr(self._miner, "field_name", "") or (Path(self._db_path).stem if self._db_path else "")
-
-        # Filter & counts are optional (fill if your miner can provide them)
-        filt = None
-        n_points = None
-
-        return {
-            "id": sid,
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "ra_str": ra_str,
-            "dec_str": dec_str,
-            "mag": None if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else float(imag),
-            "filt": filt,
-            "n_points": n_points,
-            "field_name": field,
-            "simbad_id": None,
-        }
-
-    def get_selected_star_data(self) -> Optional[dict]:
-        """Best-effort dict for the currently selected star."""
-        item: StarRow | None = self._sel.get_selected_item()
-        if item is None:
-            return None
-        return self._row_to_data(item)
-
-    def get_selected_star_payload(self):
-        """
-        Return (data_dict, refs_list, points_list) for the current selection.
-        StarDetailsWindow will happily accept this tuple.
-        """
-        item: StarRow | None = self._sel.get_selected_item()
-        if item is None:
-            return None
-        sid = int(getattr(item.props, "id", -1))
-        data = self._row_to_data(item)
-        refs = self._fetch_refs_for(sid)
-        pts = self._fetch_points_for(sid)
-        return (data, refs, pts)
-
-    # ---- Optional reference stars / points --------------------------------
-
-    def get_selected_reference_strings(self) -> list[str]:
-        """Expose reference star labels (if your miner can provide them)."""
-        item: StarRow | None = self._sel.get_selected_item()
-        if item is None:
-            return []
-        sid = int(getattr(item.props, "id", -1))
-        return self._fetch_refs_for(sid)
-
-    def get_lightcurve_points_for_selection(self) -> list[tuple[str, str]]:
-        """Expose (x,y) light-curve rows as strings for the selected star."""
-        item: StarRow | None = self._sel.get_selected_item()
-        if item is None:
-            return []
-        sid = int(getattr(item.props, "id", -1))
-        return self._fetch_points_for(sid)
-
-    # ---- Miner adapters (robust to different miner APIs) -------------------
-
-    def _fetch_refs_for(self, star_id: int) -> list[str]:
-        if not self._miner:
-            return []
-        candidates = [
-            "get_reference_labels",
-            "get_reference_strings",
-            "get_reference_stars",
-            "get_references_for_star",
-            "reference_labels_for_star",
-        ]
-        for name in candidates:
-            fn = getattr(self._miner, name, None)
-            if callable(fn):
-                try:
-                    rv = fn(star_id)
-                    if isinstance(rv, list):
-                        # Normalize any non-strings to strings like "ID: …" if needed
-                        return [str(x) for x in rv]
-                except Exception:
-                    continue
-        return []
-
-    def _fetch_points_for(self, star_id: int) -> list[tuple[str, str]]:
-        if not self._miner:
-            return []
-        candidates = [
-            "get_lightcurve_points",
-            "get_lightcurve",
-            "get_curve",
-            "get_star_curve",
-            "load_lightcurve_for_star",
-            "lightcurve_for_star",
-        ]
-        # Expect either list[(x,y)], list[dict], or numpy/pandas-like objects; normalize to strings.
-        for name in candidates:
-            fn = getattr(self._miner, name, None)
-            if callable(fn):
-                try:
-                    rv = fn(star_id)
-                except Exception:
-                    continue
-                if rv is None:
-                    continue
-                out: list[tuple[str, str]] = []
-                try:
-                    # list of tuples/lists
-                    for row in rv:
-                        if isinstance(row, (list, tuple)) and len(row) >= 2:
-                            out.append((str(row[0]), str(row[1])))
-                        elif isinstance(row, dict):
-                            x = row.get("HJD") or row.get("hjd") or row.get("x") or row.get("t")
-                            y = row.get("Mag") or row.get("mag") or row.get("y")
-                            if x is not None and y is not None:
-                                out.append((str(x), str(y)))
-                    if out:
-                        return out
-                except Exception:
-                    pass
-                # Numpy/pandas-ish fallback
-                try:
-                    xs = getattr(rv, "x", None) or getattr(rv, "HJD", None) or getattr(rv, "hjd", None)
-                    ys = getattr(rv, "y", None) or getattr(rv, "Mag", None) or getattr(rv, "mag", None)
-                    if xs is not None and ys is not None:
-                        out = [(str(xs[i]), str(ys[i])) for i in range(min(len(xs), len(ys)))]
-                        if out:
-                            return out
-                except Exception:
-                    pass
-        return []
+    # -------- Autoselect & auto-open --------
+    def _ensure_autoselect_when_ready(self) -> None:
+        if self._autoselect_done or not self._autoselect_radec:
+            return
+        if self._sort_model.get_n_items() > 0:
+            GLib.idle_add(self._do_autoselect_now)
+            return
+        def on_items_changed(model, _pos, _removed, _added):
+            if model.get_n_items() > 0 and not self._autoselect_done:
+                GLib.idle_add(self._do_autoselect_now)
+            try: model.disconnect(handler_id)
+            except Exception: pass
+        handler_id = self._sort_model.connect("items-changed", on_items_changed)
