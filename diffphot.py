@@ -41,7 +41,6 @@ that the former is brighter than the latter.
 
 import copy
 import logging
-import optparse
 import os
 import multiprocessing
 import pwd
@@ -778,25 +777,27 @@ def parallel_light_curves(args):
     queue.put((star.id, light_curve))
 
 
+# -------- argparse-based CLI (replaces optparse .add_option / OptionGroup) --------
+
 parser = customparser.get_parser(description)
-parser.usage = "%prog [OPTION]... INPUT_DB OUTPUT_DB"
-parser.add_option(
+parser.usage = "%(prog)s [OPTION]... INPUT_DB OUTPUT_DB"
+
+# global options
+parser.add_argument(
     "--overwrite",
     action="store_true",
     dest="overwrite",
     help="overwrite output database if it already exists",
 )
-
-parser.add_option(
+parser.add_argument(
     "--cores",
     action="store",
-    type="int",
+    type=int,
     dest="ncores",
     default=defaults.ncores,
     help=defaults.desc["ncores"],
 )
-
-parser.add_option(
+parser.add_argument(
     "-v",
     "--verbose",
     action="count",
@@ -805,108 +806,107 @@ parser.add_option(
     help=defaults.desc["verbosity"],
 )
 
-curves_group = optparse.OptionGroup(parser, "Light Curves", "")
-curves_group.add_option(
+# argument groups
+curves_group = parser.add_argument_group("Light Curves", "")
+curves_group.add_argument(
     "--minimum-images",
     action="store",
-    type="int",
+    type=int,
     dest="min_images",
     default=10,
     help="the minimum number of images in which a star "
-    "must have been observed; the light curve will not be "
-    "calculated for those filters for which the star was "
-    "observed a number of times lower than this value "
-    "[default: %default]",
+         "must have been observed; the light curve will not be "
+         "calculated for those filters for which the star was "
+         "observed a number of times lower than this value "
+         "[default: %(default)s]",
 )
-
-curves_group.add_option(
+curves_group.add_argument(
     "--stars",
     action="store",
-    type="int",
+    type=int,
     dest="ncstars",
     default=20,
     help="number of complete stars that will be used as "
-    "the artificial comparison star. For each star, its "
-    "'complete' set are those stars for which there is "
-    "photometric information in at least each of the "
-    "images in which it was observed [default: %default]",
+         "the artificial comparison star. For each star, its "
+         "'complete' set are those stars for which there is "
+         "photometric information in at least each of the "
+         "images in which it was observed [default: %(default)s]",
 )
-
-curves_group.add_option(
+curves_group.add_argument(
     "--minimum-stars",
     action="store",
-    type="int",
+    type=int,
     dest="min_cstars",
     default=8,
     help="the minimum number of stars used to compute "
-    "the artificial comparison star, regarless of the "
-    "value of the --stars option. The light curve will "
-    "not be generated if this minimum value cannot be "
-    "reached. It follows that if this option is set to a "
-    "value greater than that of --stars, no curve is "
-    "generated, so the module exits with an error. "
-    "Although acceptable, a value equal to that of "
-    "--stars is not recommended. [default: %default]",
+         "the artificial comparison star, regarless of the "
+         "value of the --stars option. The light curve will "
+         "not be generated if this minimum value cannot be "
+         "reached. It follows that if this option is set to a "
+         "value greater than that of --stars, no curve is "
+         "generated, so the module exits with an error. "
+         "Although acceptable, a value equal to that of "
+         "--stars is not recommended. [default: %(default)s]",
 )
-parser.add_option_group(curves_group)
 
-broeg_group = optparse.OptionGroup(parser, "Broeg's Algorithm", "")
-broeg_group.add_option(
+broeg_group = parser.add_argument_group("Broeg's Algorithm", "")
+broeg_group.add_argument(
     "--pct",
     action="store",
-    type="float",
+    type=float,
     dest="pct",
     default=0.01,
     help="the convergence threshold of the weights "
-    "determined by Broeg algorithm, given as a percentage "
-    "change. Iteration will stop when the percentage "
-    "change between the last two weights is less than or "
-    "equal to this value [default: %default]",
+         "determined by Broeg algorithm, given as a percentage "
+         "change. Iteration will stop when the percentage "
+         "change between the last two weights is less than or "
+         "equal to this value [default: %(default)s]",
 )
-
-broeg_group.add_option(
+broeg_group.add_argument(
     "--weights-threshold",
     action="store",
-    type="float",
+    type=float,
     dest="wminimum",
     default=0.0001,
     help="the minimum value for a coefficient to be "
-    "taken into account when calculating the percentage "
-    "change between two Weights; needed to prevent "
-    "scientifically-insignificant values from making the "
-    "algorithm stop earlier or iterate more than needed "
-    "[default: %default]",
+         "taken into account when calculating the percentage "
+         "change between two Weights; needed to prevent "
+         "scientifically-insignificant values from making the "
+         "algorithm stop earlier or iterate more than needed "
+         "[default: %(default)s]",
 )
-
-broeg_group.add_option(
+broeg_group.add_argument(
     "--max-iters",
     action="store",
-    type="int",
+    type=int,
     dest="max_iters",
     default=sys.getrecursionlimit(),
     help="the maximum number of iterations of the "
-    "algorithm. If exceeded, the last computed weights "
-    "will be taken, regardless of the percentage change. "
-    "This option defaults to the maximum depth of the "
-    "Python interpreter stack [default: %default]",
+         "algorithm. If exceeded, the last computed weights "
+         "will be taken, regardless of the percentage change. "
+         "This option defaults to the maximum depth of the "
+         "Python interpreter stack [default: %(default)s]",
 )
-parser.add_option_group(broeg_group)
 
-best_group = optparse.OptionGroup(parser, "Worst and Best Stars", "")
-best_group.add_option(
+best_group = parser.add_argument_group("Worst and Best Stars", "")
+best_group.add_argument(
     "--worst-fraction",
     action="store",
-    type="float",
+    type=float,
     dest="worst_fraction",
     default=0.10,
     help="the fraction of the stars that will be "
-    "discarded at each step when identifying which are the "
-    "most constant stars. The lower this value, the most "
-    "reliable the identification of the constant stars in "
-    "the field will be, but also more CPU-expensive "
-    "[default: %default]",
+         "discarded at each step when identifying which are the "
+         "most constant stars. The lower this value, the most "
+         "reliable the identification of the constant stars in "
+         "the field will be, but also more CPU-expensive "
+         "[default: %(default)s]",
 )
-parser.add_option_group(best_group)
+
+# positional arguments
+parser.add_argument("input_db_path", metavar="INPUT_DB")
+parser.add_argument("output_db_path", metavar="OUTPUT_DB")
+
 customparser.clear_metavars(parser)
 
 
@@ -929,7 +929,7 @@ def main(arguments=None):
 
     if arguments is None:
         arguments = sys.argv[1:]  # ignore argv[0], the script name
-    (options, args) = parser.parse_args(args=arguments)
+    options = parser.parse_args(args=arguments)
 
     # Adjust the logger level to WARNING, INFO or DEBUG, depending on the
     # given number of -v options (none, one or two or more, respectively)
@@ -940,13 +940,9 @@ def main(arguments=None):
         logging_level = logging.DEBUG
     logging.basicConfig(format=style.LOG_FORMAT, level=logging_level)
 
-    if len(args) != 2:
-        parser.print_help()
-        return 2  # used for command line syntax errors
-    else:
-        assert len(args) == 2
-        input_db_path = args[0]
-        output_db_path = args[1]
+    # Extract positionals
+    input_db_path = options.input_db_path
+    output_db_path = options.output_db_path
 
     if options.min_cstars > options.ncstars:
         print("%sError. The value of --minimum-stars must be <= --stars." % style.prefix)
@@ -955,6 +951,15 @@ def main(arguments=None):
 
     if not os.path.exists(input_db_path):
         print("%sError. Database '%s' does not exist." % (style.prefix, input_db_path))
+        print(style.error_exit_message)
+        return 1
+
+    # Ensure output directory exists
+    out_dir = os.path.dirname(output_db_path) or "."
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        print("%sError. Cannot create output directory '%s': %s" % (style.prefix, out_dir, e))
         print(style.error_exit_message)
         return 1
 
