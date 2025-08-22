@@ -1,5 +1,4 @@
 #! /usr/bin/env python3
-
 # Copyright (c) 2012 Victor Terron. All rights reserved.
 # Institute of Astrophysics of Andalusia, IAA-CSIC
 #
@@ -17,7 +16,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
-
 
 description = """
 Use the algorithm described in (Broeg et al. 2005) for computing an optimal
@@ -61,7 +59,9 @@ import database
 import defaults
 import snr
 import style
-
+from util.io import owner_writable
+from util.queue import Queue
+from util.display import show_progress
 
 def percentage_change(old, new):
     """Return the relative change between the old value and the new one.
@@ -687,10 +687,9 @@ class StarSet(object):
 # The Queue is global -- this works, but note that we could have
 # passed its reference to the function managed by pool.map_async.
 # See http://stackoverflow.com/a/3217427/184363
-queue = util.Queue()
+queue = Queue()
 
 
-@util.print_exception_traceback
 def parallel_light_curves(args):
     """Method argument of map_async to compute light curves in parallel.
 
@@ -980,7 +979,7 @@ def main(arguments=None):
     print("%sMaking a copy of the input database..." % style.prefix, end="")
     sys.stdout.flush()
     shutil.copy2(input_db_path, output_db_path)
-    util.owner_writable(output_db_path, True)  # chmod u+w
+    owner_writable(output_db_path, True)  # chmod u+w
     print("done.")
 
     with database.LEMONdB(output_db_path) as db:
@@ -1005,10 +1004,10 @@ def main(arguments=None):
             map_async_args = ((star, all_stars, options) for star in all_stars)
             result = pool.map_async(parallel_light_curves, map_async_args)
 
-            util.show_progress(0.0)
+            show_progress(0.0)
             while not result.ready():
                 time.sleep(1)
-                util.show_progress(queue.qsize() / len(all_stars) * 100)
+                show_progress(queue.qsize() / len(all_stars) * 100)
                 # Do not update the progress bar when debugging; instead, print it
                 # on a new line each time. This prevents the next logging message,
                 # if any, from being printed on the same line that the bar.
@@ -1016,13 +1015,13 @@ def main(arguments=None):
                     print()
 
             result.get()  # reraise exceptions of the remote call, if any
-            util.show_progress(100)  # in case the queue was ready too soon
+            show_progress(100)  # in case the queue was ready too soon
             print()
 
             # The multiprocessing queue contains two-element tuples,
             # mapping the ID of each star to its light curve.
             print("%sStoring the light curves in the database..." % style.prefix)
-            util.show_progress(0)
+            show_progress(0)
             light_curves = (queue.get() for x in range(queue.qsize()))
             for index, (star_id, curve) in enumerate(light_curves):
 
@@ -1040,7 +1039,7 @@ def main(arguments=None):
                 db.add_light_curve(star_id, curve)
                 logging.debug("Light curve for star %d successfully stored" % star_id)
 
-                util.show_progress(100 * (index + 1) / len(all_stars))
+                show_progress(100 * (index + 1) / len(all_stars))
                 if logging_level < logging.WARNING:
                     print()
 
@@ -1050,7 +1049,7 @@ def main(arguments=None):
                 db.commit()
                 logging.info("Database transaction commited")
 
-                util.show_progress(100.0)
+                show_progress(100.0)
                 print()
 
         print("%sUpdating statistics about tables and indexes..." % style.prefix, end="")
@@ -1064,7 +1063,7 @@ def main(arguments=None):
         db.hostname = socket.gethostname()
         db.commit()
 
-    util.owner_writable(output_db_path, False)  # chmod u-w
+    owner_writable(output_db_path, False)  # chmod u-w
     print("%sYou're done ^_^" % style.prefix)
     return 0
 

@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 
-import passband
-
 # Copyright (c) 2012 Victor Terron. All rights reserved.
 # Institute of Astrophysics of Andalusia, IAA-CSIC
 #
@@ -74,8 +72,7 @@ import qphot
 import seeing
 import style
 from util.queue import Queue
-import re as _re
-from util.display import show_progress,utctime
+from util.display import show_progress, utctime
 from util.io import owner_writable, clean_tmp_files
 from util.coords import DD_to_HMS, DD_to_DMS
 from util.log import func_catchall
@@ -148,12 +145,82 @@ def get_fwhm(img, options):
         logging.debug(msg % args)
         return fwhm
 
+
+def _median_fwhm_for_filter(images_in_filter, options, max_samples=5):
+    """Best-effort median FWHM for a set of images in one filter.
+
+    Prefer header keyword (fast). If missing, compute FWHM for up to
+    `max_samples` images spread across the list (slower but bounded).
+    """
+    vals = []
+    # 1) Try headers (fast)
+    for path in images_in_filter:
+        img = fitsimage.FITSImage(path)
+        try:
+            vals.append(float(img.read_keyword(options.fwhmk)))
+        except Exception:
+            continue
+    if len(vals) >= 3:
+        return float(numpy.median(vals))
+
+    # 2) Bounded sampling (slow but limited)
+    if not images_in_filter:
+        return None
+    step = max(1, len(images_in_filter) // max_samples)
+    sample = images_in_filter[::step][:max_samples]
+    for path in sample:
+        try:
+            img = fitsimage.FITSImage(path)
+            vals.append(float(get_fwhm(img, options)))
+        except Exception as e:
+            logging.debug("FWHM sampling failed for %s: %s", path, e)
+            continue
+    if vals:
+        return float(numpy.median(vals))
+    return None
+
+
+def sources_image_fwhm_fast(sources_img, files_by_filter, options):
+    """Return an FWHM to size apertures on the sources image without hanging.
+
+    Strategy:
+      1) If sources image has FWHM keyword -> use it.
+      2) If exactly one filter is present among INPUT_IMGS, use that filter's
+         median FWHM (from headers if possible; otherwise from a small sample).
+      3) Fallback to computing FWHM on the sources image (may be slow).
+    """
+    # 1) Direct header on sources image
+    try:
+        f = float(sources_img.read_keyword(options.fwhmk))
+        logging.debug("%s: using sources header FWHM = %.3f", sources_img.path, f)
+        return f
+    except Exception:
+        pass
+
+    # 2) Single-filter shortcut
+    non_empty_filters = [pf for pf, imgs in files_by_filter.items() if imgs]
+    if len(non_empty_filters) == 1:
+        pf = non_empty_filters[0]
+        est = _median_fwhm_for_filter(files_by_filter[pf], options)
+        if est is not None:
+            logging.debug(
+                "%s: using median FWHM from filter %s = %.3f",
+                sources_img.path, pf, est
+            )
+            return est
+
+    # 3) Last resort: compute on the sources image
+    logging.debug("%s: falling back to computing FWHM on sources image", sources_img.path)
+    return float(get_fwhm(sources_img, options))
+
+
 def iraf_safe_path(p) -> str:
     """Normalize to an IRAF-safe filename: absolute, POSIX, no '//'."""
     s = Path(p).resolve().as_posix()
     while '//' in s:
         s = s.replace('//', '/')
     return s
+
 
 def parallel_photometry(args):
     """Function argument of map_async() to do photometry in parallel.
@@ -452,7 +519,7 @@ def main(arguments: list[str] | None = None):
     if arguments is None:
         arguments = sys.argv[1:]  # ignore argv[0], the script name
 
-        # argparse already expects strings
+    # argparse already expects strings
     options = parser.parse_args(args=arguments)
 
     # Adjust the logger level to WARNING, INFO or DEBUG, depending on the
@@ -468,12 +535,10 @@ def main(arguments: list[str] | None = None):
         parser.print_help()
         return 2
 
-        # --- SANITIZE ALL PATHS EARLY (IRAF-safe) ---
+    # --- SANITIZE ALL PATHS EARLY (IRAF-safe) ---
     sources_img_path = iraf_safe_path(options.paths[0])
     input_paths = set(iraf_safe_path(p) for p in options.paths[1:-1])
     output_db_path = iraf_safe_path(options.paths[-1])
-    assert input_paths
-
     assert input_paths
 
     # If the user gives an empty string as the FITS keyword which stores the
@@ -616,7 +681,7 @@ def main(arguments: list[str] | None = None):
     if options.coordinates:
 
         sources_coordinates = []
-        for args in load_coordinates(options.coordinates):
+        for args in util.load_coordinates(options.coordinates):
             coords = astromatic.Coordinates(*args)
             sources_coordinates.append(coords)
 
@@ -964,7 +1029,9 @@ def main(arguments: list[str] | None = None):
     # aperture and sky annulus are determined by the FWHM of the sources image.
     if not fixed_annuli:
 
-        sources_img_fwhm = get_fwhm(sources_img, options)
+        # NEW: fast path for sources image FWHM (avoids long SExtractor re-reads)
+        sources_img_fwhm = sources_image_fwhm_fast(sources_img, files, options)
+
         sources_aperture = options.aperture * sources_img_fwhm
         sources_annulus = options.annulus * sources_img_fwhm
         sources_dannulus = options.dannulus * sources_img_fwhm
@@ -1126,6 +1193,15 @@ def main(arguments: list[str] | None = None):
     msg = "%sInitializing output LEMONdB..."
     print(msg % style.prefix, end=' ')
     sys.stdout.flush()
+
+    # --- Ensure output directory exists before creating the SQLite DB ---
+    out_dir = os.path.dirname(output_db_path) or "."
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        print("%sError. Cannot create output directory '%s': %s" % (style.prefix, out_dir, e))
+        print(style.error_exit_message)
+        return 1
 
     with database.LEMONdB(output_db_path) as output_db:
 
