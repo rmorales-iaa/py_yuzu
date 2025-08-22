@@ -1,164 +1,133 @@
-# juicer/main.py
+# juicer/main.py — entrypoint that cooperates with external launchers
 from __future__ import annotations
 
 import logging
 import sys
-from pathlib import Path
-from typing import Iterable, Optional, Tuple, Any
+from typing import Iterable, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-if not logging.getLogger().handlers:
+from .app import run_app
+
+
+def _to_float(s: str) -> float:
+    return float(s.strip())
+
+
+def _parse_hms_to_deg(h: float, m: float, s: float) -> float:
+    return (abs(h) + m / 60.0 + s / 3600.0) * 15.0 * (1.0 if h >= 0 else -1.0)
+
+
+def _parse_dms_to_deg(d: float, m: float, s: float) -> float:
+    return (abs(d) + m / 60.0 + s / 3600.0) * (1.0 if d >= 0 else -1.0)
+
+
+def _parse_sexagesimal_token(tok: str) -> Tuple[float, float, float]:
+    t = tok.strip().lower().replace("h", ":").replace("m", ":").replace("s", "")
+    parts = [p for p in t.replace("::", ":").split(":") if p != ""]
+    if len(parts) == 3:
+        return (_to_float(parts[0]), _to_float(parts[1]), _to_float(parts[2]))
+    raise ValueError("not single-token sexagesimal")
+
+
+def _parse_three_tokens(tokens: List[str]) -> Tuple[float, float, float]:
+    if len(tokens) < 3:
+        raise ValueError("need three tokens")
+    return (_to_float(tokens[0]), _to_float(tokens[1]), _to_float(tokens[2]))
+
+
+def _parse_ra_triplet(tokens: List[str]) -> float:
+    try:
+        h, m, s = _parse_sexagesimal_token(tokens[0])
+        return _parse_hms_to_deg(h, m, s)
+    except Exception:
+        h, m, s = _parse_three_tokens(tokens)
+        return _parse_hms_to_deg(h, m, s)
+
+
+def _parse_dec_triplet(tokens: List[str]) -> float:
+    try:
+        d, m, s = _parse_sexagesimal_token(tokens[0])
+        return _parse_dms_to_deg(d, m, s)
+    except Exception:
+        d, m, s = _parse_three_tokens(tokens)
+        return _parse_dms_to_deg(d, m, s)
+
+
+def _extract_star(argv: List[str]) -> Tuple[List[str], Optional[Tuple[float, float]]]:
+    """
+    Remove --star ... from argv and return (argv_without_star, (ra_deg, dec_deg) or None).
+    Supports:
+      --star 00:38:17.56 +42:27:47.2
+      --star 00 38 17.56 +42 27 47.2
+      --star 9.573167 42.463111
+    """
+    if "--star" not in argv:
+        return argv, None
+
+    i = argv.index("--star")
+    rest = argv[:i] + argv[i + 1 :]
+    following = argv[i + 1 : i + 7]
+    if not following:
+        return rest, None
+
+    # Case A: RA and Dec each in a single sexagesimal token
+    if len(following) >= 2 and (":" in following[0] or any(c in following[0].lower() for c in "hms")):
+        ra = _parse_ra_triplet([following[0]])
+        dec = _parse_dec_triplet([following[1]])
+        return argv[:i] + argv[i + 3 :], (ra, dec)
+
+    # Case B: 6 tokens => H M S  D M S
+    if len(following) >= 6:
+        try:
+            ra = _parse_ra_triplet(following[0:3])
+            dec = _parse_dec_triplet(following[3:6])
+            return argv[:i] + argv[i + 7 :], (ra, dec)
+        except Exception:
+            pass
+
+    # Case C: two floats in degrees
+    if len(following) >= 2:
+        try:
+            ra = _to_float(following[0])
+            dec = _to_float(following[1])
+            return argv[:i] + argv[i + 3 :], (ra, dec)
+        except Exception:
+            pass
+
+    return rest, None
+
+
+def main(
+    *,
+    db_path: Optional[str] = None,
+    argv: Optional[Iterable[str]] = None,
+    start_radec: Optional[Tuple[float, float]] = None,
+    **kwargs,  # tolerate extra keys from external launchers
+) -> int:
+    """
+    Entry point used by external launchers (e.g., yuzu) which call:
+        juicer.main.main(**kwargs)
+    Accepts optional db_path, argv, start_radec and ignores unknown kwargs.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-
-def _pick_lemondb_from_args(db_path: Optional[str],
-                            argv: Optional[Iterable[str]]) -> Optional[str]:
-    """
-    Choose a .LEMONdB path from:
-      1) explicit db_path if it exists and endswith .LEMONdB
-      2) first argv token that points to an existing *.LEMONdB file
-    """
-    def _ok(p: Optional[str]) -> Optional[str]:
-        if not p:
-            return None
-        pp = Path(p)
-        return str(pp) if (pp.is_file() and pp.suffix.lower() == ".lemondb") else None
-
-    chosen = _ok(db_path)
-    if chosen:
-        return chosen
-    if argv:
-        for a in argv:
-            got = _ok(str(a))
-            if got:
-                return got
-    return None
-
-
-def _monkeypatch_window_autoselect(start_radec: Optional[Tuple[float, float]]) -> None:
-    """
-    If the current juicer.window.LEMONJuicerWindow doesn't take an
-    'autoselect_radec' kwarg, patch its __init__ to accept it and/or set
-    the attribute on the instance after construction.
-    Harmless if the class or module layout changes; all exceptions swallowed.
-    """
-    if not start_radec:
-        return
-    try:
-        from juicer import window as _w  # type: ignore
-        if not hasattr(_w, "LEMONJuicerWindow"):
-            return
-        LJW = _w.LEMONJuicerWindow
-        orig_init = LJW.__init__
-
-        def _init_with_autoselect(self, *args, **kwargs):
-            # Try passing the kwarg first (newer versions)
-            try:
-                return orig_init(self, *args, **kwargs, autoselect_radec=start_radec)
-            except TypeError:
-                # Fall back: call original and then set attribute
-                rv = orig_init(self, *args, **kwargs)
-                try:
-                    setattr(self, "_autoselect_radec", start_radec)
-                except Exception:
-                    pass
-                return rv
-
-        # Only patch once
-        if getattr(LJW, "_lemon_autoselect_patched", False) is not True:
-            _w.LEMONJuicerWindow.__init__ = _init_with_autoselect  # type: ignore[assignment]
-            setattr(LJW, "_lemon_autoselect_patched", True)
-    except Exception:
-        # Non-fatal if anything goes wrong; the app can still run.
-        pass
-
-
-def run_app(db_path: Optional[str] = None,
-            argv: Optional[Iterable[str]] = None,
-            start_radec: Optional[Tuple[float, float]] = None) -> int:
-    """
-    Preferred entry point. Tries to call juicer.app.run_app(...).
-    If unavailable, constructs LEMONJuicerApp directly.
-
-    Returns:
-        0   on normal exit,
-        130 on Ctrl+C / SIGINT,
-        2   on startup/runtime errors.
-    """
-    # Ensure the window will receive autoselect coords even on older apps
-    _monkeypatch_window_autoselect(start_radec)
-
-    # Pick a database path if needed
-    chosen = _pick_lemondb_from_args(db_path, argv or sys.argv[1:])
-    if chosen:
-        logger.info("Startup requested DB path: %s", chosen)
+    # Build argv list: prefer explicit argv, else kwargs 'args', else sys.argv[1:]
+    if argv is None:
+        maybe_args = kwargs.get("args")
+        args_list = list(maybe_args) if maybe_args is not None else list(sys.argv[1:])
     else:
-        logger.info("No valid *.LEMONdB provided on startup.")
+        args_list = list(argv)
 
-    # Import app and run
-    try:
-        from juicer import app as app_mod  # type: ignore
-    except Exception as e:
-        logger.error("Cannot import juicer.app: %s", e)
-        return 2
+    # Some wrappers include a "juicer" token — ignore it
+    if args_list and args_list[0] == "juicer":
+        args_list = args_list[1:]
 
-    # If app provides a run_app, prefer that (try modern signature first)
-    if hasattr(app_mod, "run_app"):
-        try:
-            return int(app_mod.run_app(db_path=chosen, argv=None, start_radec=start_radec) or 0)  # type: ignore[arg-type]
-        except TypeError:
-            # Fall back through a few older signatures
-            for sig in (
-                dict(db_path=chosen, argv=None),
-                dict(db_path=chosen),
-                dict(),
-            ):
-                try:
-                    return int(app_mod.run_app(**sig) or 0)  # type: ignore[misc]
-                except TypeError:
-                    continue
-        except KeyboardInterrupt:
-            return 130
-        except Exception as e:
-            logger.error("juicer.app.run_app crashed: %s", e)
-            return 2
+    # If start_radec wasn't provided, try to parse --star from args
+    if start_radec is None:
+        args_list, start_radec = _extract_star(args_list)
 
-        logger.error("juicer.app.run_app exists but no compatible signature matched.")
-        return 2
-
-    # Otherwise, try to build and run the application directly
-    App: Any = getattr(app_mod, "LEMONJuicerApp", None)
-    if App is None:
-        logger.error("juicer.app has neither run_app() nor LEMONJuicerApp.")
-        return 2
-
-    try:
-        try:
-            app = App(db_path=chosen, autoselect_radec=start_radec)
-        except TypeError:
-            app = App(db_path=chosen)  # type: ignore[call-arg]
-            # window gets patched to hold _autoselect_radec by _monkeypatch_window_autoselect
-
-        try:
-            return int(app.run(list(argv) if argv is not None else None) or 0)
-        except KeyboardInterrupt:
-            return 130
-
-    except Exception as e:
-        logger.error("Failed to start LEMONJuicerApp: %s", e)
-        return 2
-
-
-def main(db_path: Optional[str] = None,
-         argv: Optional[Iterable[str]] = None,
-         start_radec: Optional[Tuple[float, float]] = None) -> int:
-    """
-    Backwards/forwards compatible main(). Accepts optional db_path,
-    argv (iterable), and start_radec=(ra_deg, dec_deg).
-    """
-    return run_app(db_path=db_path, argv=argv, start_radec=start_radec)
+    # Delegate to the app runner; it will also pick a .LEMONdB from remaining args if db_path is None
+    return run_app(db_path=db_path, argv=args_list, start_radec=start_radec)
 
 
 if __name__ == "__main__":
-    # Allow direct execution: python -m juicer.main /path/to/file.LEMONdB
     sys.exit(main(argv=sys.argv[1:]))

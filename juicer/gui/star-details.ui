@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+
+  <object class="GtkWindow" id="star_details_window">
+    <property name="title">Star details</property>
+    <property name="default-width">840</property>
+    <property name="default-height">600</property>
+
+    <child type="titlebar">
+      <object class="GtkHeaderBar">
+        <property name="show-title-buttons">true</property>
+        <child type="end">
+          <object class="GtkButton" id="btn_close">
+            <property name="icon-name">window-close-symbolic</property>
+            <property name="tooltip-text">Close</property>
+          </object>
+        </child>
+      </object>
+    </child>
+
+    <child>
+      <!-- Root content: vertical stack -->
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <property name="spacing">10</property>
+        <property name="margin-top">12</property>
+        <property name="margin-bottom">12</property>
+        <property name="margin-start">12</property>
+        <property name="margin-end">12</property>
+
+        <!-- ID row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label">ID</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_id">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- RA row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label">RA</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_ra">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Dec row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label">Dec</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_dec">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Mag row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label">Mag</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_mag">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Filter row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label">Filter</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_filt">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- N points row -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">8</property>
+            <child>
+              <object class="GtkLabel">
+                <property name="label"># Points</property>
+                <property name="xalign">0</property>
+                <property name="width-chars">10</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_npts">
+                <property name="xalign">0</property>
+                <property name="hexpand">true</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Action buttons -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">6</property>
+            <child>
+              <object class="GtkButton" id="btn_chart">
+                <property name="label">Finding chart</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkButton" id="btn_simbad">
+                <property name="label">Open in SIMBAD</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Reference stars -->
+        <child>
+          <object class="GtkFrame">
+            <property name="label">Reference stars</property>
+            <child>
+              <object class="GtkScrolledWindow">
+                <property name="min-content-height">120</property>
+                <child>
+                  <object class="GtkListView" id="list_refs"/>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Points table -->
+        <child>
+          <object class="GtkFrame">
+            <property name="label">Light-curve points</property>
+            <child>
+              <object class="GtkScrolledWindow">
+                <property name="min-content-height">160</property>
+                <child>
+                  <object class="GtkTreeView" id="tree_points"/>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+
+      </object>
+    </child>
+  </object>
+</interface>

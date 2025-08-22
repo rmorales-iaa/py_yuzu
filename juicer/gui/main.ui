@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+
+  <!-- Application menubar (Gio.MenuModel) -->
+  <menu id="app-menu">
+    <section>
+      <item>
+        <attribute name="label">_Open Database?</attribute>
+        <attribute name="action">app.open_db</attribute>
+      </item>
+      <item>
+        <attribute name="label">Open?</attribute>
+        <attribute name="action">app.open</attribute>
+      </item>
+    </section>
+    <section>
+      <item>
+        <attribute name="label">Go to ID?</attribute>
+        <attribute name="action">app.goto</attribute>
+      </item>
+      <item>
+        <attribute name="label">Go to Selection</attribute>
+        <attribute name="action">app.goto_selection</attribute>
+      </item>
+    </section>
+    <section>
+      <item>
+        <attribute name="label">Mark as Reference</attribute>
+        <attribute name="action">app.mark_reference</attribute>
+      </item>
+      <item>
+        <attribute name="label">Accept Lightcurve</attribute>
+        <attribute name="action">app.accept_lightcurve</attribute>
+      </item>
+      <item>
+        <attribute name="label">Reject Lightcurve</attribute>
+        <attribute name="action">app.reject_lightcurve</attribute>
+      </item>
+    </section>
+    <section>
+      <item>
+        <attribute name="label">Quit</attribute>
+        <attribute name="action">app.quit</attribute>
+      </item>
+    </section>
+  </menu>
+
+  <!-- Main window skeleton -->
+  <object class="GtkApplicationWindow" id="main_window">
+    <property name="default-width">1100</property>
+    <property name="default-height">720</property>
+    <property name="title">LEMON Juicer</property>
+
+    <child type="titlebar">
+      <object class="GtkHeaderBar">
+        <property name="show-title-buttons">true</property>
+        <child type="start">
+          <object class="GtkButton" id="header_open_btn">
+            <property name="label">Open DB</property>
+            <property name="action-name">app.open_db</property>
+          </object>
+        </child>
+      </object>
+    </child>
+
+    <child>
+      <object class="GtkBox" id="root_box">
+        <property name="orientation">vertical</property>
+        <property name="spacing">8</property>
+        <property name="margin-top">8</property>
+        <property name="margin-bottom">8</property>
+        <property name="margin-start">8</property>
+        <property name="margin-end">8</property>
+        <child>
+          <object class="GtkLabel" id="placeholder_label">
+            <property name="label">Main UI loaded (GTK4). Your LEMONJuicerWindow will populate content programmatically.</property>
+            <property name="wrap">true</property>
+            <property name="xalign">0</property>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>

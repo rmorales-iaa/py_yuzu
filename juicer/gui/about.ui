@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+
+  <object class="GtkDialog" id="about_dialog">
+    <property name="modal">true</property>
+    <property name="default-width">520</property>
+    <property name="default-height">340</property>
+    <property name="resizable">false</property>
+
+    <child type="titlebar">
+      <object class="GtkHeaderBar">
+        <property name="show-title-buttons">false</property>
+        <property name="title-widget">
+          <object class="GtkLabel">
+            <property name="label">About LEMON Juicer</property>
+          </object>
+        </property>
+        <child type="end">
+          <object class="GtkButton" id="btn_close">
+            <property name="label">Close</property>
+          </object>
+        </child>
+      </object>
+    </child>
+
+    <child>
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <property name="spacing">10</property>
+        <property name="margin-top">14</property>
+        <property name="margin-bottom">14</property>
+        <property name="margin-start">16</property>
+        <property name="margin-end">16</property>
+
+        <!-- App name + version -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">10</property>
+            <child>
+              <object class="GtkImage" id="img_logo">
+                <property name="icon-name">lemon-juicer</property>
+                <property name="pixel-size">48</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkBox">
+                <property name="orientation">vertical</property>
+                <property name="spacing">2</property>
+                <child>
+                  <object class="GtkLabel" id="lbl_appname">
+                    <property name="label">LEMON Juicer</property>
+                    <property name="xalign">0</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="lbl_version">
+                    <property name="label">Version 1.0.0</property>
+                    <property name="xalign">0</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Description -->
+        <child>
+          <object class="GtkLabel" id="lbl_description">
+            <property name="xalign">0</property>
+            <property name="wrap">true</property>
+            <property name="label">Interactive light-curve inspection and finding charts for LEMON photometry databases.</property>
+          </object>
+        </child>
+
+        <!-- Links -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">12</property>
+            <child>
+              <object class="GtkLinkButton" id="lnk_home">
+                <property name="label">Project Homepage</property>
+                <property name="uri">https://example.org/lemon-juicer</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLinkButton" id="lnk_issues">
+                <property name="label">Report an Issue</property>
+                <property name="uri">https://example.org/lemon-juicer/issues</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Credits -->
+        <child>
+          <object class="GtkFrame">
+            <property name="label">Credits</property>
+            <child>
+              <object class="GtkScrolledWindow">
+                <property name="min-content-height">140</property>
+                <child>
+                  <object class="GtkTextView" id="txt_credits">
+                    <property name="editable">false</property>
+                    <property name="wrap-mode">word</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- License -->
+        <child>
+          <object class="GtkLabel" id="lbl_license">
+            <property name="xalign">0</property>
+            <property name="wrap">true</property>
+            <property name="label">Licensed under the GPLv3. See LICENSE file for details.</property>
+          </object>
+        </child>
+
+      </object>
+    </child>
+  </object>
+</interface>
