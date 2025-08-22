@@ -14,6 +14,8 @@ from typing import List, Optional, Tuple
 # Enforce minimum versions via import hooks in sys.meta_path
 import check_versions  # noqa: F401
 
+os.environ.setdefault("GSK_RENDERER", "gl")
+
 # Allow rebinding the configuration file before importing UI modules
 try:
     from conf_manager.conf_manager import cfg

@@ -472,13 +472,27 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
     def _open_star_window(self, row: StarRow) -> None:
         try:
             if self._star_win is not None:
-                try: self._star_win.destroy()
-                except Exception: pass
+                try:
+                    self._star_win.destroy()
+                except Exception:
+                    pass
                 self._star_win = None
         except Exception:
             self._star_win = None
+
         try:
-            self._star_win = StarDetailsWindow(self, row, self._miner)
+            # Build payload directly from this row
+            data = self._row_to_data(row)
+            refs = self._fetch_refs_for(int(getattr(row.props, "id", -1)))
+            pts = self._fetch_points_for(int(getattr(row.props, "id", -1)))
+
+            self._star_win = StarDetailsWindow(self, data=data)
+            # Push refs/points (if we found any)
+            try:
+                self._star_win.set_star_data(data, reference_rows=refs or None, point_rows=pts or None)
+            except Exception:
+                pass
+
             self._star_win.present()
         except Exception as e:
             self._show_error(f"Could not open star window:\n{e}", title="Star Window Error")
@@ -959,3 +973,148 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
         # Initial autoselect (if requested)
         self._ensure_autoselect_when_ready()
+
+    def _row_to_data(self, row: StarRow) -> dict:
+        """Convert a StarRow into the dict StarDetailsWindow expects."""
+        try:
+            sid = int(getattr(row.props, "id", -1))
+            ra = float(getattr(row.props, "ra", 0.0))
+            dec = float(getattr(row.props, "dec", 0.0))
+            imag = getattr(row.props, "imag", float("nan"))
+        except Exception:
+            sid, ra, dec, imag = -1, 0.0, 0.0, float("nan")
+
+        # Pretty strings for RA/Dec
+        ra_str = _hms_from_deg(ra)
+        dec_str = _dms_from_deg(dec)
+
+        # Field name from miner or file
+        field = getattr(self._miner, "field_name", "") or (Path(self._db_path).stem if self._db_path else "")
+
+        # Filter & counts are optional (fill if your miner can provide them)
+        filt = None
+        n_points = None
+
+        return {
+            "id": sid,
+            "ra_deg": ra,
+            "dec_deg": dec,
+            "ra_str": ra_str,
+            "dec_str": dec_str,
+            "mag": None if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else float(imag),
+            "filt": filt,
+            "n_points": n_points,
+            "field_name": field,
+            "simbad_id": None,
+        }
+
+    def get_selected_star_data(self) -> Optional[dict]:
+        """Best-effort dict for the currently selected star."""
+        item: StarRow | None = self._sel.get_selected_item()
+        if item is None:
+            return None
+        return self._row_to_data(item)
+
+    def get_selected_star_payload(self):
+        """
+        Return (data_dict, refs_list, points_list) for the current selection.
+        StarDetailsWindow will happily accept this tuple.
+        """
+        item: StarRow | None = self._sel.get_selected_item()
+        if item is None:
+            return None
+        sid = int(getattr(item.props, "id", -1))
+        data = self._row_to_data(item)
+        refs = self._fetch_refs_for(sid)
+        pts = self._fetch_points_for(sid)
+        return (data, refs, pts)
+
+    # ---- Optional reference stars / points --------------------------------
+
+    def get_selected_reference_strings(self) -> list[str]:
+        """Expose reference star labels (if your miner can provide them)."""
+        item: StarRow | None = self._sel.get_selected_item()
+        if item is None:
+            return []
+        sid = int(getattr(item.props, "id", -1))
+        return self._fetch_refs_for(sid)
+
+    def get_lightcurve_points_for_selection(self) -> list[tuple[str, str]]:
+        """Expose (x,y) light-curve rows as strings for the selected star."""
+        item: StarRow | None = self._sel.get_selected_item()
+        if item is None:
+            return []
+        sid = int(getattr(item.props, "id", -1))
+        return self._fetch_points_for(sid)
+
+    # ---- Miner adapters (robust to different miner APIs) -------------------
+
+    def _fetch_refs_for(self, star_id: int) -> list[str]:
+        if not self._miner:
+            return []
+        candidates = [
+            "get_reference_labels",
+            "get_reference_strings",
+            "get_reference_stars",
+            "get_references_for_star",
+            "reference_labels_for_star",
+        ]
+        for name in candidates:
+            fn = getattr(self._miner, name, None)
+            if callable(fn):
+                try:
+                    rv = fn(star_id)
+                    if isinstance(rv, list):
+                        # Normalize any non-strings to strings like "ID: …" if needed
+                        return [str(x) for x in rv]
+                except Exception:
+                    continue
+        return []
+
+    def _fetch_points_for(self, star_id: int) -> list[tuple[str, str]]:
+        if not self._miner:
+            return []
+        candidates = [
+            "get_lightcurve_points",
+            "get_lightcurve",
+            "get_curve",
+            "get_star_curve",
+            "load_lightcurve_for_star",
+            "lightcurve_for_star",
+        ]
+        # Expect either list[(x,y)], list[dict], or numpy/pandas-like objects; normalize to strings.
+        for name in candidates:
+            fn = getattr(self._miner, name, None)
+            if callable(fn):
+                try:
+                    rv = fn(star_id)
+                except Exception:
+                    continue
+                if rv is None:
+                    continue
+                out: list[tuple[str, str]] = []
+                try:
+                    # list of tuples/lists
+                    for row in rv:
+                        if isinstance(row, (list, tuple)) and len(row) >= 2:
+                            out.append((str(row[0]), str(row[1])))
+                        elif isinstance(row, dict):
+                            x = row.get("HJD") or row.get("hjd") or row.get("x") or row.get("t")
+                            y = row.get("Mag") or row.get("mag") or row.get("y")
+                            if x is not None and y is not None:
+                                out.append((str(x), str(y)))
+                    if out:
+                        return out
+                except Exception:
+                    pass
+                # Numpy/pandas-ish fallback
+                try:
+                    xs = getattr(rv, "x", None) or getattr(rv, "HJD", None) or getattr(rv, "hjd", None)
+                    ys = getattr(rv, "y", None) or getattr(rv, "Mag", None) or getattr(rv, "mag", None)
+                    if xs is not None and ys is not None:
+                        out = [(str(xs[i]), str(ys[i])) for i in range(min(len(xs), len(ys)))]
+                        if out:
+                            return out
+                except Exception:
+                    pass
+        return []
