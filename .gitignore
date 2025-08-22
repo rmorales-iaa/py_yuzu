@@ -1,4 +1,7 @@
 test/output/*
 test/small_sample/*
-__pycache__/*
+# Python bytecode and cache directories
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
