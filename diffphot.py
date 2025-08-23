@@ -2,555 +2,415 @@
 # -*- coding: utf-8 -*-
 
 """
-Differential photometry: build light curves by subtracting, for each star
-and image, the weighted ensemble of the best (least-variable) comparison
-stars observed in the same photometric filter.
+diffphot.py ? LEMON differential photometry (SQLAlchemy, thread-safe)
 
-Python 3 port of LEMON's `diffphot.py`, modernized to:
-  - Use your provided database facade (SQLAlchemy LEMONSA-compatible).
-  - Parallelize per-star computations with threads.
-  - ALWAYS batch/parallelize DB writes with threads (no legacy single-thread path).
-  - Preserve LEMON-style messages and behavior.
+Port of LEMON's diffphot that keeps the familiar CLI / messages while using the
+SQLAlchemy-backed, thread-safe database facade in `database.py`.
 
-High-level steps:
-  1) Copy the input database file to the output path (unless --overwrite).
-  2) For each selected photometric filter:
-     a) Load per-star photometry time series.
-     b) Estimate frame zero-points and per-star residual scatter.
-     c) Iteratively discard the worst fraction (highest scatter) to choose
-        comparison stars; compute weights ~ 1/stdev^2.
-     d) Build differential light curves for all stars.
-     e) Store comparison-star sets and light curves in the DB.
+High level:
+- Read stars/images/photometry from INPUT_DB
+- For each filter, compute ensemble differential light curves:
+    * Rank stars by raw-magnitude scatter (robust stdev)
+    * Choose up to --max-cmp lowest-scatter comparison stars
+    * For every target star, at each time, subtract the weighted mean of the
+      comparison stars measured on that same image (excluding the target)
+- Write results into OUTPUT_DB:
+    * images (copied from input so times/filters exist)
+    * stars (copied from input so ids align)
+    * cmp_stars entries (for each target)
+    * light_curves points (differential magnitudes)
+
+Thread safety:
+- All DB I/O goes through the SQLAlchemy facade (`database.LEMONSA` or `LEMONdB`)
+  which uses scoped sessions (one per thread). Compute steps use ThreadPoolExecutor.
+
+Note:
+- This is an intentionally pragmatic port: it produces useful, ensemble-based
+  differential curves with sensible defaults without reproducing every upstream
+  heuristic. You can tune options like --max-cmp, --min-snr, etc.
 """
 
 from __future__ import annotations
 
-# stdlib
-import collections
-import concurrent.futures
+import argparse
+import concurrent.futures as cf
 import logging
 import math
 import os
-import os.path
 import shutil
 import sys
+from collections import defaultdict, Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-from contextlib import contextmanager
+from statistics import median
 
-# 3rd / project modules (provided by user environment)
-import numpy
+import numpy as np
 
-import customparser
-import defaults
-import style
 import database
+import style
+import defaults
 
-from util.display import show_progress
-from util.io import owner_writable
+# ------------------------------------------------------------------------------
+# Helpers to tolerate either class name and either curve class
+# ------------------------------------------------------------------------------
 
+DBClass = getattr(database, "LEMONdB", None) or getattr(database, "LEMONSA")
+if DBClass is None:
+    raise RuntimeError("database module must define LEMONdB or LEMONSA")
 
-# -----------------------------------------------------------------------------
+LightCurveClass = getattr(database, "LightCurveItem", None) or getattr(database, "LightCurve")
+
+# ------------------------------------------------------------------------------
 # CLI
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 description = """
-Compute differential photometry from an existing LEMON database containing
-instrumental magnitudes. For each photometric filter, the program selects
-a robust set of non-variable comparison stars and, for every star, subtracts
-the weighted ensemble magnitude frame by frame to produce a differential
-light curve.
+Compute differential photometry light curves from an existing photometry database.
+
+Usage:
+  yuzu diffphot INPUT_DB OUTPUT_DB [options]
 """
 
-parser = customparser.get_parser(description)
+parser = argparse.ArgumentParser(
+    prog="diffphot",
+    description=description.strip(),
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+)
 parser.usage = "%(prog)s [OPTION]... INPUT_DB OUTPUT_DB"
 
-# General
-parser.add_argument("--overwrite",
-                    action="store_true",
-                    dest="overwrite",
-                    help="overwrite OUTPUT_DB if it already exists")
+parser.add_argument("input_db", help="LEMON database with raw photometry")
+parser.add_argument("output_db", help="output LEMON database for differential light curves")
 
-parser.add_argument("-v", "--verbose",
-                    action="count",
-                    dest="verbose",
-                    default=defaults.verbosity,
-                    help=defaults.desc.get("verbosity", ""))
-
-parser.add_argument("--cores",
-                    action="store",
-                    type=int,
-                    dest="ncores",
-                    default=defaults.ncores,
-                    help=defaults.desc.get("ncores", ""))
-
-parser.add_argument("--db-workers",
-                    action="store",
-                    type=int,
-                    dest="db_workers",
-                    default=max(2, min(8, getattr(defaults, "ncores", 4))),
-                    help="number of parallel DB writer threads [default: based on cores]")
-
-parser.add_argument("--db-chunk",
-                    action="store",
-                    type=int,
-                    dest="db_chunk",
-                    default=32,
-                    help="number of stars per DB write chunk (default: %(default)s)")
-
-# Filter selection
-filter_group = parser.add_argument_group(
-    "Filter images for differential photometry",
-    "Select which photometric filters to process."
+parser.add_argument("--overwrite", action="store_true", help="overwrite OUTPUT_DB if it already exists")
+parser.add_argument(
+    "--cores",
+    type=int,
+    default=max(1, min(8, getattr(defaults, "ncores", 1))),
+    help="parallel workers for curve building",
 )
-filter_group.add_argument("--filter",
-                          action="append",
-                          type=str,
-                          dest="filters",
-                          default=None,
-                          help=defaults.desc.get("pfilter", "photometric filter to consider (may be repeated)"))
+parser.add_argument("--filter", action="append", dest="filters", default=None,
+                    help="process only this photometric filter (may be repeated)")
+parser.add_argument("--min-snr", type=float, default=1.0,
+                    help="ignore photometric points with SNR below this threshold")
+parser.add_argument("--max-cmp", type=int, default=20,
+                    help="maximum number of comparison stars per target")
+parser.add_argument("--min-cmp", type=int, default=5,
+                    help="minimum number of valid comparison stars required per target time")
+parser.add_argument("--robust", action="store_true",
+                    help="use MAD-based robust scatter to rank comparison stars (else, std)")
+parser.add_argument("-v", "--verbose", action="count", default=getattr(defaults, "verbosity", 0),
+                    help="increase output verbosity (repeat for more)")
 
-filter_group.add_argument("--exclude",
-                          action="append",
-                          type=str,
-                          dest="excluded_filters",
-                          default=None,
-                          help=("ignore these photometric filters. Opposite of --filter; "
-                                "may be given multiple times."))
+# ------------------------------------------------------------------------------
+# Utility
+# ------------------------------------------------------------------------------
 
-# Differential-photometry algorithm
-algo = parser.add_argument_group("Algorithm",
-                                 "Tune the selection of comparison stars and light-curve build.")
-algo.add_argument("--worst-fraction",
-                  action="store",
-                  type=float,
-                  dest="worst_fraction",
-                  default=0.20,
-                  help="fraction of the stars (highest scatter) to discard at each iteration [default: %(default).2f]")
-
-algo.add_argument("--iterations",
-                  action="store",
-                  type=int,
-                  dest="iterations",
-                  default=3,
-                  help="number of discard iterations [default: %(default)s]")
-
-algo.add_argument("--min-cstars",
-                  action="store",
-                  type=int,
-                  dest="min_cstars",
-                  default=12,
-                  help="minimum number of comparison stars to keep [default: %(default)s]")
-
-algo.add_argument("--min-points",
-                  action="store",
-                  type=int,
-                  dest="min_points",
-                  default=5,
-                  help="minimum number of valid points per star to be considered [default: %(default)s]")
-
-algo.add_argument("--snr-cut",
-                  action="store",
-                  type=float,
-                  dest="snr_cut",
-                  default=1.0,
-                  help="ignore measurements with SNR below this threshold [default: %(default).1f]")
-
-customparser.clear_metavars(parser)
-
-
-# -----------------------------------------------------------------------------
-# Helpers for DB open
-# -----------------------------------------------------------------------------
-@contextmanager
-def _open_db(path: str):
-    """
-    Open the database, supporting either `database.LEMONdB` (classic name)
-    or `database.LEMONSA` (SQLAlchemy port). Closes cleanly on exit.
-    """
-    DBClass = getattr(database, "LEMONdB", None) or getattr(database, "LEMONSA", None)
-    if DBClass is None:
-        raise RuntimeError("No DB class found (expected LEMONdB or LEMONSA)")
-
-    db = DBClass(path)
-    try:
-        yield db
-    finally:
-        if hasattr(db, "close_all"):
-            db.close_all()
-        elif hasattr(db, "close"):
-            db.close()
-
-# -----------------------------------------------------------------------------
-# Types expected from DB facade
-# -----------------------------------------------------------------------------
-
-LightCurve = getattr(database, "LightCurve")
-LightCurveItem = getattr(database, "LightCurveItem")
-
-
-# -----------------------------------------------------------------------------
-# Core math
-# -----------------------------------------------------------------------------
-
-def _median_ignore_nan(arr: Sequence[float]) -> float:
-    vals = [x for x in arr if x is not None and not numpy.isnan(x)]
-    return float(numpy.median(vals)) if vals else float("nan")
-
-
-def _stdev_ignore_nan(arr: Sequence[float]) -> float:
-    vals = [x for x in arr if x is not None and not numpy.isnan(x)]
-    if len(vals) < 2:
+def _robust_stdev(x: np.ndarray) -> float:
+    """Robust scatter estimator ~ 1.4826 * MAD (like upstream)."""
+    x = x[np.isfinite(x)]
+    if x.size < 2:
         return float("inf")
-    return float(numpy.std(vals, ddof=1))
+    med = np.median(x)
+    return 1.4826 * np.median(np.abs(x - med))
 
+def _plain_stdev(x: np.ndarray) -> float:
+    x = x[np.isfinite(x)]
+    if x.size < 2:
+        return float("inf")
+    return float(np.std(x))
 
-def _weighted_mean(values: Sequence[float], weights: Sequence[float]) -> Optional[float]:
-    vs, ws = [], []
-    for v, w in zip(values, weights):
-        if v is None or numpy.isnan(v) or w <= 0:
+def _weight_from_stdev(sd: float) -> float:
+    if not math.isfinite(sd) or sd <= 0:
+        return 0.0
+    return 1.0 / (sd * sd)
+
+def _copy_stars_images(db_in: DBClass, db_out: DBClass):
+    """Ensure output DB has identical stars and image rows (times/filters)
+    so light_curve insertions can resolve image_id via (filter, time)."""
+    # Copy stars
+    for sid in db_in.star_ids:
+        s = db_in.get_star(sid)  # (id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag)
+        db_out.add_star(*s)
+
+    # Copy images per filter by re-adding with same attributes
+    for pf in db_in.pfilters:
+        # Pull image times + basic columns through photometry join to ensure coverage
+        # We'll just scan photometry(image_id) -> images rows
+        from sqlalchemy import select
+        # Use db_in.session directly (scoped in its facade)
+        with db_in.session() as s:
+            # ORM classes from database module
+            ImageRow = database.ImageRow
+            PhotometricFilter = database.PhotometricFilter
+            rows = s.execute(
+                select(ImageRow.path, ImageRow.unix_time, ImageRow.object, ImageRow.airmass,
+                       ImageRow.gain, ImageRow.ra, ImageRow.dec, ImageRow.sources)
+                .join(PhotometricFilter, PhotometricFilter.id == ImageRow.filter_id)
+                .where(PhotometricFilter.name == str(pf))
+                .order_by(ImageRow.unix_time.asc())
+            ).all()
+        for path, t, obj, am, g, ra, dec, sources in rows:
+            db_out.add_image(database.Image(path=path, pfilter=pf, unix_time=t, object=obj,
+                                            airmass=am, gain=g, ra=ra, dec=dec, sources=int(sources or 0)))
+
+# ------------------------------------------------------------------------------
+# Differential photometry core
+# ------------------------------------------------------------------------------
+
+def _collect_filter_data(db: DBClass, pfilter: str, min_snr: float):
+    """Return:
+        times          : sorted unique Unix times for this filter
+        star_to_points : dict[star_id] -> list of (t, mag, snr)
+    """
+    star_to_points = {}
+    # Using public API; DBStar encapsulates time-ordered photometry for (star, filter)
+    for sid in db.star_ids:
+        star = db.get_photometry(sid, pfilter)  # DBStar
+        if len(star) == 0:
             continue
-        vs.append(v)
-        ws.append(w)
-    if not vs or not ws:
-        return None
-    return float(numpy.average(vs, weights=ws))
-
-
-def _collect_times(star_series: Dict[int, "DBStar"]) -> List[float]:
-    ts = set()
-    for st in star_series.values():
-        for i in range(st.n):
-            t = st.time(i)
-            if t is None:
+        pts = []
+        for i in range(len(star)):
+            t = star.time(i)
+            m = star.mag(i)
+            s = star.snr(i)
+            if s is None or s < min_snr or not math.isfinite(m):
                 continue
-            ts.add(float(t))
-    return sorted(ts)
+            pts.append((t, m, s))
+        if pts:
+            star_to_points[sid] = pts
+    # Gather times
+    time_set = set()
+    for pts in star_to_points.values():
+        for t, _, _ in pts:
+            time_set.add(float(t))
+    times = sorted(time_set)
+    return times, star_to_points
 
+def _rank_comparison_stars(star_to_points, robust: bool):
+    """Compute per-star scatter and return [(sid, stdev)] sorted ascending."""
+    stdev_fn = _robust_stdev if robust else _plain_stdev
+    ranking = []
+    for sid, pts in star_to_points.items():
+        mags = np.array([m for _, m, _ in pts], dtype=float)
+        sd = stdev_fn(mags)
+        ranking.append((sid, float(sd)))
+    ranking.sort(key=lambda x: (x[1], x[0]))
+    return ranking
 
-def _build_zero_points(times: List[float],
-                       star_series: Dict[int, "DBStar"],
-                       snr_cut: float) -> Dict[float, float]:
-    zps: Dict[float, float] = {}
-    for t in times:
-        mags = []
-        for st in star_series.values():
-            idx = st.idx_for_time(t)
-            if idx is None or idx < 0:
-                continue
-            s = st.snr(idx)
-            if (s is not None) and (s < snr_cut):
-                continue
-            mags.append(st.mag(idx))
-        zps[t] = _median_ignore_nan(mags)
-    return zps
+def _build_cmp_pool(ranking, max_cmp: int):
+    """Return the set of comparison-star IDs (global pool for this filter)."""
+    pool = [sid for sid, sd in ranking if math.isfinite(sd)]
+    return pool[:max_cmp] if max_cmp > 0 else pool
 
+def _index_points_by_time(pts):
+    """Return dict[time] -> (mag, snr) for a star."""
+    d = {}
+    for t, m, s in pts:
+        d[float(t)] = (float(m), float(s))
+    return d
 
-def _per_star_residual_stdev(star_series: Dict[int, "DBStar"],
-                             zps: Dict[float, float],
-                             snr_cut: float,
-                             min_points: int) -> Dict[int, float]:
-    out: Dict[int, float] = {}
-    for sid, st in star_series.items():
-        resids = []
-        for i in range(st.n):
-            m = st.mag(i)
-            t = st.time(i)
-            if t is None:
-                continue
-            zp = zps.get(float(t))
-            if zp is None or numpy.isnan(zp):
-                continue
-            s = st.snr(i)
-            if (s is not None) and (s < snr_cut):
-                continue
-            if m is None or numpy.isnan(m):
-                continue
-            resids.append(m - zp)
-        if len(resids) >= max(2, min_points):
-            out[sid] = _stdev_ignore_nan(resids)
-        else:
-            out[sid] = float("inf")
-    return out
+def _build_one_curve(
+    target_id: int,
+    pfilter: str,
+    times,
+    star_to_points,
+    cmp_pool,
+    ranking_map,
+    min_cmp: int,
+) -> tuple[int, LightCurveClass]:
+    """Compute one star's differential light curve."""
+    # Prepare structures
+    target_pts = _index_points_by_time(star_to_points.get(target_id, []))
+    # Comparison weights from ranking map (lower sd => larger weight)
+    # Convert stdev -> weight = 1/sd^2; normalize per-target per-time by available ones.
+    curve = LightCurveClass(pfilter=pfilter, cstars=[], cweights=[], cstdevs=[])
+    # Record chosen cmp stars + weights once (global, from ranking) so they go to cmp_stars table
+    cstars = []
+    cweights = []
+    cstdevs = []
+    for sid in cmp_pool:
+        if sid == target_id:
+            continue
+        sd = ranking_map.get(sid, float("inf"))
+        w = _weight_from_stdev(sd)
+        if w <= 0:
+            continue
+        cstars.append(int(sid))
+        cweights.append(float(w))
+        cstdevs.append(float(sd))
+    if not cstars:
+        # no comparison stars ? return empty curve
+        return target_id, curve
 
-
-def _select_comparison_stars(stdevs: Dict[int, float],
-                             worst_fraction: float,
-                             iterations: int,
-                             min_cstars: int) -> List[int]:
-    pool = [sid for sid, sd in stdevs.items() if math.isfinite(sd)]
-    if not pool:
-        return []
-    pool.sort(key=lambda sid: stdevs[sid])  # best first
-
-    for _ in range(max(0, int(iterations))):
-        if len(pool) <= max(1, int(min_cstars)):
-            break
-        kdrop = max(1, int(math.floor(len(pool) * float(worst_fraction))))
-        del pool[-kdrop:]  # drop worst
-        if len(pool) <= max(1, int(min_cstars)):
-            break
-
-    if len(pool) > min_cstars:
-        pool = pool[:min_cstars]
-    return pool
-
-
-def _weights_from_stdev(stdevs: Dict[int, float], cstars: List[int]) -> List[float]:
-    eps = 1e-8
-    vals = []
-    for sid in cstars:
-        sd = float(stdevs.get(sid, float("inf")))
-        w = 1.0 / max(sd * sd, eps)
-        vals.append(w)
-    s = sum(vals) or 1.0
-    return [w / s for w in vals]
-
-
-def _build_light_curve_for_star(star_id: int,
-                                pfilter: str,
-                                star_series: Dict[int, "DBStar"],
-                                cstars: List[int],
-                                cweights: List[float],
-                                snr_cut: float) -> Optional["LightCurve"]:
-    target = star_series.get(star_id)
-    if target is None:
-        return None
-
-    curve = LightCurve(pfilter)
+    # Normalize the *stored* weights (cmp_stars); per-time normalization re-done below after masking Nones
+    ws = np.asarray(cweights, dtype=float)
+    ws = ws / ws.sum() if ws.sum() > 0 else ws
     curve.cstars = list(cstars)
-    curve.cweights = list(cweights)
-    curve.cstdevs = []  # filled by caller
+    curve.cweights = ws
+    curve.cstdevs = np.asarray(cstdevs, dtype=float)
 
-    for i in range(target.n):
-        t = target.time(i)
-        m = target.mag(i)
-        s = target.snr(i)
-        if t is None or m is None or numpy.isnan(m):
+    # Build differential points
+    # Strategy: at each time, from the comparison pool, take those with measurements at this time,
+    # renormalize their weights, compute weighted mean, subtract from target magnitude.
+    # If target has no measurement at t, skip t.
+    # If fewer than min_cmp available comparisons at t, skip that time.
+    # Keep original SNR of target point for the light curve row.
+    cmp_maps = {sid: _index_points_by_time(star_to_points[sid]) for sid in curve.cstars if sid in star_to_points}
+
+    for t in times:
+        tgt = target_pts.get(t)
+        if tgt is None:
             continue
-        if (s is not None) and (s < snr_cut):
+        tgt_mag, tgt_snr = tgt
+        # Collect available comparison mags at this time
+        mags = []
+        ww = []
+        for sid, w in zip(curve.cstars, curve.cweights):
+            m = cmp_maps.get(sid, {}).get(t)
+            if m is None:
+                continue
+            mags.append(m[0])
+            ww.append(float(w))
+        if len(mags) < min_cmp:
             continue
-
-        present_weights = []
-        present_mags = []
-        for sid, w in zip(cstars, cweights):
-            st = star_series.get(sid)
-            if st is None:
-                continue
-            idx = st.idx_for_time(t)
-            if idx is None or idx < 0:
-                continue
-            cm = st.mag(idx)
-            if cm is None or numpy.isnan(cm):
-                continue
-            present_mags.append(cm)
-            present_weights.append(w)
-
-        comp_mean = _weighted_mean(present_mags, present_weights)
-        if comp_mean is None or numpy.isnan(comp_mean):
+        wsum = sum(ww)
+        if wsum <= 0:
             continue
+        wnorm = [w / wsum for w in ww]
+        cmp_mean = float(np.dot(wnorm, np.asarray(mags, dtype=float)))
+        diff_mag = float(tgt_mag - cmp_mean)
+        curve.add(t, diff_mag, None if tgt_snr is None else float(tgt_snr))
 
-        diff_mag = float(m) - float(comp_mean)
-        curve.append(LightCurveItem(float(t), diff_mag, None if s is None else float(s)))
+    return target_id, curve
 
-    return curve if len(curve) > 0 else None
-
-
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # main
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
-def main(arguments=None):
-    if arguments is None:
-        arguments = sys.argv[1:]
-    (options, args) = parser.parse_known_args(list(map(str, arguments)))
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    opts = parser.parse_args(argv)
 
     # logging
-    logging_level = logging.WARNING
-    if options.verbose == 1:
-        logging_level = logging.INFO
-    elif options.verbose and int(options.verbose) >= 2:
-        logging_level = logging.DEBUG
-    logging.basicConfig(level=logging_level, format=getattr(style, "logging_format", "%(message)s"))
+    level = logging.WARNING
+    if opts.verbose == 1:
+        level = logging.INFO
+    elif opts.verbose and int(opts.verbose) >= 2:
+        level = logging.DEBUG
+    logging.basicConfig(level=level, format=getattr(style, "logging_format", "%(message)s"))
 
-    # ------------------------------------------------------------------
-    # Inputs
-    # ------------------------------------------------------------------
-    if len(args) < 2:
-        print("Usage:")
-        print(parser.format_usage())
-        return 2
+    in_path = Path(opts.input_db)
+    out_path = Path(opts.output_db)
 
-    input_db_path = args[0]
-    output_db_path = args[-1]
+    # Overwrite
+    if out_path.exists() and opts.overwrite:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
 
-    if not Path(input_db_path).exists():
-        print(f"{style.prefix}Error. Input database file not found: {input_db_path}")
+    # Open DBs
+    db_in = DBClass(str(in_path))
+    db_out = DBClass(str(out_path))
+
+    # Copy stars & images (so light_curve points can resolve image_id by (filter, time))
+    print(f"{style.prefix}Making a copy of the input database...", end="")
+    sys.stdout.flush()
+    _copy_stars_images(db_in, db_out)
+    print("done.")
+
+    # Determine filters to process
+    filters = db_in.pfilters
+    if opts.filters:
+        want = set(map(str, opts.filters))
+        filters = [pf for pf in filters if pf in want]
+    if not filters:
+        print(f"{style.prefix}Error. No matching photometric filters found to process.")
         print(style.error_exit_message)
         return 1
 
-    # Prepare output DB file
-    if Path(output_db_path).exists():
-        if options.overwrite:
-            try:
-                os.remove(output_db_path)
-            except OSError:
-                pass
-        else:
-            print(f"{style.prefix}Error. Output database already exists: {output_db_path}")
-            print(style.error_exit_message)
-            return 1
+    # Per-filter processing
+    for pf in filters:
+        print(style.prefix)
+        print(f"{style.prefix}Processing filter {pf} ...")
 
-    print(f"{style.prefix}Making a copy of the input database...", end=" ")
-    sys.stdout.flush()
-    shutil.copy2(input_db_path, output_db_path)
-    print("done.")
+        # Collect raw photometry per star and the union of times
+        times, star_to_points = _collect_filter_data(db_in, pf, min_snr=float(opts.min_snr))
+        nstars = len(star_to_points)
+        print(f"{style.prefix}{nstars} stars with usable photometry; {len(times)} timestamps.")
 
-    # ------------------------------------------------------------------
-    # Open DB
-    # ------------------------------------------------------------------
-    with _open_db(output_db_path) as db:
+        if nstars == 0 or len(times) == 0:
+            continue
 
-        # Determine filters to process
-        pfilters = list(getattr(db, "pfilters", []))
-        if not pfilters:
-            print(f"{style.prefix}Error. No photometric filters found in the database.")
-            print(style.error_exit_message)
-            return 1
+        # Rank potential comparison stars
+        ranking = _rank_comparison_stars(star_to_points, robust=bool(opts.robust))
+        ranking_map = {sid: sd for sid, sd in ranking}
+        cmp_pool = _build_cmp_pool(ranking, max_cmp=int(opts.max_cmp))
 
-        if options.filters:
-            selected = set(options.filters)
-            pfilters = [pf for pf in pfilters if pf in selected]
-        if options.excluded_filters:
-            excluded = set(options.excluded_filters)
-            pfilters = [pf for pf in pfilters if pf not in excluded]
-
-        if not pfilters:
-            print(f"{style.prefix}Error. No photometric filters to process after applying include/exclude.")
-            print(style.error_exit_message)
-            return 1
-
-        print(f"{style.prefix}{len(pfilters)} photometric filter(s) will be processed: {', '.join(sorted(pfilters))}")
-
-        # Star list
-        star_ids: List[int] = list(getattr(db, "star_ids", []))
-        if not star_ids:
-            print(f"{style.prefix}Error. No stars found in the database.")
-            print(style.error_exit_message)
-            return 1
-
-        # ------------------------------------------------------------------
-        # Process each filter independently
-        # ------------------------------------------------------------------
-        for pf in sorted(pfilters):
-            print(style.prefix)
-            print(f"{style.prefix}Working on the '{pf}' filter.")
-            sys.stdout.flush()
-
-            # 1) Load per-star photometry for this filter
-            print(f"{style.prefix}Loading photometry for {len(star_ids)} stars...", end=" ")
-            sys.stdout.flush()
-            star_series: Dict[int, "DBStar"] = {}
-            for sid in star_ids:
+        # Parallel build of curves
+        work_ids = sorted(star_to_points.keys())
+        results = []
+        print(f"{style.prefix}Building differential light curves in parallel ({opts.cores} workers)...")
+        with cf.ThreadPoolExecutor(max_workers=max(1, int(opts.cores))) as ex:
+            futs = [
+                ex.submit(
+                    _build_one_curve, sid, pf, times, star_to_points, cmp_pool, ranking_map, int(opts.min_cmp)
+                )
+                for sid in work_ids
+            ]
+            for i, fut in enumerate(cf.as_completed(futs), 1):
                 try:
-                    st = db.get_photometry(int(sid), str(pf))
+                    results.append(fut.result())
                 except Exception as e:
-                    logging.debug("get_photometry failed for star %r filter %s: %s", sid, pf, e)
-                    st = None
-                if st is not None and getattr(st, "n", 0) >= options.min_points:
-                    star_series[int(sid)] = st
-            print(f"done. ({len(star_series)} usable)")
-            if not star_series:
-                print(f"{style.prefix}Warning: no usable stars for {pf}. Skipping.")
+                    logging.debug("curve worker failed: %s", e)
+                # tiny progress pulse
+                if level <= logging.INFO and (i % max(1, len(work_ids)//10) == 0):
+                    print(f"{style.prefix}  ... {i}/{len(work_ids)}", flush=True)
+
+        # Store
+        print(f"{style.prefix}Saving light curves to the database...")
+        saved = 0
+        for sid, curve in results:
+            if len(curve) == 0 or len(curve.cstars) == 0:
                 continue
+            db_out.add_light_curve(int(sid), curve)
+            saved += 1
+        print(f"{style.prefix}{saved} curves written for filter {pf}.")
 
-            # 2) Build per-frame zero points and per-star scatter
-            print(f"{style.prefix}Estimating per-frame zero-points (median across stars)...", end=" ")
-            sys.stdout.flush()
-            times = _collect_times(star_series)
-            zps = _build_zero_points(times, star_series, float(options.snr_cut))
-            print("done.")
+    # Basic metadata on output DB (best-effort; not all keys may exist in your facade)
+    import time, socket, getpass, hashlib
+    try:
+        db_out.date = time.time()
+    except Exception:
+        pass
+    try:
+        db_out.author = getpass.getuser()
+    except Exception:
+        pass
+    try:
+        db_out.hostname = socket.gethostname()
+    except Exception:
+        pass
+    try:
+        h = hashlib.md5()
+        h.update(str(getattr(db_out, "date", "")).encode("utf-8"))
+        h.update(str(getattr(db_out, "author", "")).encode("utf-8"))
+        h.update(str(getattr(db_out, "hostname", "")).encode("utf-8"))
+        db_out.id = h.hexdigest()
+    except Exception:
+        pass
 
-            print(f"{style.prefix}Measuring residual scatter per star...", end=" ")
-            sys.stdout.flush()
-            stdevs = _per_star_residual_stdev(star_series, zps, float(options.snr_cut), int(options.min_points))
-            print("done.")
-
-            # 3) Select comparison stars (one ensemble for the filter)
-            print(f"{style.prefix}Selecting comparison stars (iteratively discarding worst fraction = {options.worst_fraction:.2f})...", end=" ")
-            sys.stdout.flush()
-            cstars = _select_comparison_stars(stdevs,
-                                              float(options.worst_fraction),
-                                              int(options.iterations),
-                                              int(options.min_cstars))
-            if not cstars:
-                print("\n" + f"{style.prefix}Error. Failed to select comparison stars for filter '{pf}'.")
-                print(style.error_exit_message)
-                return 1
-            cweights = _weights_from_stdev(stdevs, cstars)
-            cstdevs = [float(stdevs[sid]) for sid in cstars]
-            print(f"done. ({len(cstars)} stars)")
-
-            # 4) Build differential light curves for *all* stars (parallel compute)
-            print(f"{style.prefix}Building differential light curves...", end=" ")
-            sys.stdout.flush()
-
-            def _worker(sid: int) -> Tuple[int, Optional["LightCurve"]]:
-                curve = _build_light_curve_for_star(sid, str(pf), star_series,
-                                                    cstars=cstars, cweights=cweights,
-                                                    snr_cut=float(options.snr_cut))
-                if curve is not None:
-                    curve.cstdevs = list(cstdevs)
-                return (sid, curve)
-
-            curves: Dict[int, "LightCurve"] = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(options.ncores))) as ex:
-                for sid, curve in ex.map(_worker, star_series.keys()):
-                    if curve is not None and len(curve) > 0:
-                        curves[int(sid)] = curve
-
-            print(f"done. ({len(curves)} light curves)")
-
-            # 5) Store in DB ? ALWAYS parallel with threads
-            print(f"{style.prefix}Storing comparison sets and light curves in the database...")
-            sys.stdout.flush()
-
-            curve_items = list(curves.items())
-            chunk = max(1, int(options.db_chunk))
-            chunks = [curve_items[i:i + chunk] for i in range(0, len(curve_items), chunk)]
-            total = len(chunks)
-            show_progress(0.0)
-
-            def _store_chunk(items: List[Tuple[int, "LightCurve"]]) -> int:
-                ok = 0
-                # Avoid shared-transaction context when multithreading; rely on per-call sessions
-                for sid, curve in items:
-                    try:
-                        db.add_light_curve(int(sid), curve)
-                        ok += 1
-                    except Exception as e:
-                        logging.debug("add_light_curve failed for star %r in %s: %s", sid, pf, e)
-                return ok
-
-            done = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(options.db_workers))) as wex:
-                futs = [wex.submit(_store_chunk, ch) for ch in chunks]
-                for idx, fut in enumerate(concurrent.futures.as_completed(futs), 1):
-                    try:
-                        done += int(fut.result())
-                    except Exception as e:
-                        logging.debug("DB writer chunk failed for filter %s: %s", pf, e)
-                    show_progress(100.0 * idx / float(total))
-            if logging_level < logging.WARNING:
-                print()
-            logging.debug("Stored %d / %d light curves in %s", done, len(curves), pf)
-
-        # End filters loop
-
-    owner_writable(output_db_path, False)
+    # ANALYZE
+    print(f"{style.prefix}Analyzing database statistics...", end="")
+    sys.stdout.flush()
+    try:
+        db_out.analyze()
+    except Exception:
+        pass
+    print("done.")
     print(f"{style.prefix}You're done ^_^")
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     sys.exit(main())
