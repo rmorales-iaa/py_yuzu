@@ -40,6 +40,7 @@ import shutil
 import socket
 import sys
 import time
+import argparse
 
 # LEMON modules
 import util
@@ -332,54 +333,6 @@ def _trim_star_to_times(star, times_sorted):
     return database.DBStar(star.id, star.pfilter, phot, t_index, dtype)
 
 
-def _select_comparisons_with_intersection(star, all_stars, min_images, min_cstars, max_cstars):
-    """Pick comparison stars whose *intersection of times* with `star` has >= min_images."""
-    base_times = set(star._time_indexes.keys())
-
-    overlaps = []
-    for cand in all_stars:
-        if cand.id == star.id or cand.pfilter != star.pfilter:
-            continue
-        tset = base_times.intersection(cand._time_indexes.keys())
-        if len(tset) >= min_images:
-            overlaps.append((cand, tset))
-
-    if len(overlaps) < 1:  # allow fallback with >=1 comp
-        return None, None
-
-    # Sort by descending overlap size
-    overlaps.sort(key=lambda ct: len(ct[1]), reverse=True)
-
-    # Try cohort sizes from max down to 1 (we'll fallback if <3 later)
-    max_try = min(len(overlaps), max_cstars)
-    for k in range(max_try, 0, -1):
-        common = base_times.copy()
-        for _, tset in overlaps[:k]:
-            common &= tset
-            if len(common) < min_images:
-                break
-
-        if len(common) >= min_images:
-            times_sorted = sorted(common)
-            trimmed_star = _trim_star_to_times(star, times_sorted)
-            if trimmed_star is None:
-                continue
-
-            trimmed_comps = []
-            ok = True
-            for cand, _ in overlaps[:k]:
-                tc = _trim_star_to_times(cand, times_sorted)
-                if tc is None or len(tc) != len(trimmed_star):
-                    ok = False
-                    break
-                trimmed_comps.append(tc)
-
-            if ok and len(trimmed_comps) >= 1:
-                return trimmed_star, trimmed_comps
-
-    return None, None
-
-
 def _simple_weighted_curve(trimmed_star, trimmed_comps):
     """
     Build a LightCurve using a simple inverse-std weighting of comparison stars.
@@ -422,56 +375,112 @@ def _simple_weighted_curve(trimmed_star, trimmed_comps):
     return curve
 
 
-def _compute_light_curve_for_star(args):
-    """Worker: compute light curve for a single star. Returns (star_id, curve_or_None)."""
-    star, all_stars, options = args
-    logging.debug(
-        "Star %d: photometry on %d images, enforced minimum of %d",
-        star.id, len(star), options.min_images
-    )
-    if star.id == 137:
-        print("FIXME")
+# ----------------------- PARALLEL WORKER STATE (PER PROCESS) -----------------------
 
-    if len(star) < options.min_images:
+# These globals live only inside worker processes after _pool_init has run.
+_WORK_STARS = None          # list[DBStar]
+_WORK_TIMESETS = None       # list[set(unix_time)]
+_WORK_OPTIONS = None        # argparse.Namespace
+
+def _pool_init(stars, timesets, options):
+    """Initializer for worker processes: install read-only data once per worker."""
+    global _WORK_STARS, _WORK_TIMESETS, _WORK_OPTIONS
+    _WORK_STARS = stars
+    _WORK_TIMESETS = timesets
+    _WORK_OPTIONS = options
+
+
+def _select_comparisons_intersection_fast(idx):
+    """Fast comparator selection using precomputed time sets in worker globals.
+
+    Returns (trimmed_star, trimmed_comps) or (None, None)
+    """
+    star = _WORK_STARS[idx]
+    base_times = _WORK_TIMESETS[idx]
+    min_images = _WORK_OPTIONS.min_images
+    max_cstars = _WORK_OPTIONS.ncstars
+
+    # Compute overlaps with all other candidates (same filter in this batch)
+    overlaps = []
+    for j, cand in enumerate(_WORK_STARS):
+        if j == idx:
+            continue
+        # same filter guaranteed by caller
+        other_times = _WORK_TIMESETS[j]
+        inter_size = len(base_times & other_times)
+        if inter_size >= min_images:
+            overlaps.append((j, inter_size))
+
+    if not overlaps:
+        return None, None
+
+    # Sort by decreasing overlap size
+    overlaps.sort(key=lambda t: t[1], reverse=True)
+
+    # Try with up to max_cstars best candidates, reduce until intersection >= min_images
+    max_try = min(len(overlaps), max_cstars)
+    for k in range(max_try, 0, -1):
+        common = set(base_times)
+        for j, _ in overlaps[:k]:
+            common &= _WORK_TIMESETS[j]
+            if len(common) < min_images:
+                break
+        if len(common) >= min_images:
+            times_sorted = sorted(common)
+            trimmed_star = _trim_star_to_times(star, times_sorted)
+            if trimmed_star is None:
+                continue
+            trimmed_comps = []
+            ok = True
+            for j, _ in overlaps[:k]:
+                tc = _trim_star_to_times(_WORK_STARS[j], times_sorted)
+                if tc is None or len(tc) != len(trimmed_star):
+                    ok = False
+                    break
+                trimmed_comps.append(tc)
+            if ok and trimmed_comps:
+                return trimmed_star, trimmed_comps
+
+    return None, None
+
+
+def _compute_light_curve_for_star_idx(idx):
+    """Worker: compute light curve for star index `idx`. Returns (star_id, curve_or_None)."""
+    star = _WORK_STARS[idx]
+    if len(star) < _WORK_OPTIONS.min_images:
         logging.debug("Star %d: ignored (minimum of %d images not met)",
-                      star.id, options.min_images)
+                      star.id, _WORK_OPTIONS.min_images)
         return (star.id, None)
 
-    trimmed_star, trimmed_comps = _select_comparisons_with_intersection(
-        star,
-        all_stars,
-        min_images=options.min_images,
-        min_cstars=options.min_cstars,
-        max_cstars=options.ncstars,
-    )
-
+    trimmed_star, trimmed_comps = _select_comparisons_intersection_fast(idx)
     if trimmed_star is None or not trimmed_comps:
         logging.debug("Star %d: no feasible comparison set after time intersection", star.id)
         return (star.id, None)
 
-    # If we have at least 3 comparison stars, use Broeg's algorithm
-    if len(trimmed_comps) >= max(3, options.min_cstars):
+    # If we have at least 3 comparison stars, try Broeg's algorithm
+    if len(trimmed_comps) >= max(3, _WORK_OPTIONS.min_cstars):
         try:
-            ncstars = min(len(trimmed_comps), options.ncstars)
-            complete_stars = StarSet(trimmed_comps)
-            comparison_stars = complete_stars.best(
+            ncstars = min(len(trimmed_comps), _WORK_OPTIONS.ncstars)
+            comparison_stars = StarSet(trimmed_comps)
+            best_set = comparison_stars.best(
                 ncstars,
-                fraction=options.worst_fraction,
-                pct=options.pct,
-                minimum=options.wminimum,
-                max_iters=options.max_iters,
+                fraction=_WORK_OPTIONS.worst_fraction,
+                pct=_WORK_OPTIONS.pct,
+                minimum=_WORK_OPTIONS.wminimum,
+                max_iters=_WORK_OPTIONS.max_iters,
             )
-            cweights = comparison_stars.broeg_weights(
-                pct=options.pct, minimum=options.wminimum, max_iters=options.max_iters
+            cweights = best_set.broeg_weights(
+                pct=_WORK_OPTIONS.pct,
+                minimum=_WORK_OPTIONS.wminimum,
+                max_iters=_WORK_OPTIONS.max_iters,
             )
-            light_curve = comparison_stars.light_curve(cweights, trimmed_star)
-            logging.debug("Star %d: light curve generated (stdev=%.4f)",
-                          star.id, light_curve.stdev)
+            light_curve = best_set.light_curve(cweights, trimmed_star)
+            logging.debug("Star %d: light curve generated (stdev=%.4f)", star.id, light_curve.stdev)
             return (star.id, light_curve)
         except Exception as e:
             logging.debug("Star %d: Broeg path failed (%s); falling back to simple weighting", star.id, e)
 
-    # Fallback: simple inverse-std weighting even with 1?2 comps
+    # Fallback: simple inverse-std weighting
     try:
         light_curve = _simple_weighted_curve(trimmed_star, trimmed_comps)
         if light_curve is None:
@@ -656,17 +665,26 @@ def main(arguments=None):
             all_stars = [db.get_photometry(star_id, pfilter) for star_id in db.star_ids]
             print("done.")
 
-            # Generate & store light curves in parallel, returning results directly
+            # Precompute time sets once (huge speedup) and keep data in workers via initializer.
+            timesets = [set(s._time_indexes.keys()) for s in all_stars]
+
+            # Generate & store light curves in parallel, using per-process globals to avoid
+            # re-pickling the whole `all_stars` list for each task.
             print("%sGenerating and storing light curves..." % style.prefix)
             total = len(all_stars)
             stored = 0
             processed = 0
             show_progress(0.0)
 
-            pool = multiprocessing.Pool(options.ncores)
-            try:
-                args_iter = ((star, all_stars, options) for star in all_stars)
-                for star_id, curve in pool.imap_unordered(_compute_light_curve_for_star, args_iter, chunksize=1):
+            # Choose a larger chunksize to reduce IPC overhead for many stars
+            chunksize = max(1, total // (options.ncores * 8) or 1)
+
+            with multiprocessing.Pool(
+                processes=options.ncores,
+                initializer=_pool_init,
+                initargs=(all_stars, timesets, options),
+            ) as pool:
+                for star_id, curve in pool.imap_unordered(_compute_light_curve_for_star_idx, range(total), chunksize=chunksize):
                     processed += 1
                     if curve is None:
                         logging.debug("Nothing for star %d; light curve not generated", star_id)
@@ -677,9 +695,6 @@ def main(arguments=None):
                     show_progress(100.0 * processed / max(1, total))
                     if logging_level < logging.WARNING:
                         print()
-            finally:
-                pool.close()
-                pool.join()
 
             print("%sStored %d/%d light curves for %s" % (style.prefix, stored, total, pfilter))
             print("%sCommitting database transaction" % style.prefix)
