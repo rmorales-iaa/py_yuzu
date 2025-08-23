@@ -1,56 +1,76 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+SQLAlchemy-based, thread-safe implementation of the astronomy database API
+aligned to the provided SQLite schemas.
+
+- Uses SQLAlchemy 2.0 style ORM.
+- Each thread uses its own Session via scoped_session.
+- SQLite pragmas configured on connect: foreign_keys=ON, busy_timeout=5000, WAL.
+- Public API mirrors the earlier sqlite3-based version where practical.
+
+Install:
+    pip install sqlalchemy
+
+Note: This module defines domain helper classes (Image, LightCurve, DBStar) to keep
+the external API similar to the previous implementation.
+"""
 
 from __future__ import annotations
 
-import collections
 import contextlib
-import sqlite3
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple, Dict
+import threading
+from dataclasses import dataclass
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy
 
-import util
-try:
-    from passband import Passband
-except Exception:  # pragma: no cover
-    class Passband(str):
-        def __new__(cls, name: str):
-            return str.__new__(cls, name)
-
-
-PhotometricParameters = collections.namedtuple(
-    "PhotometricParameters", "aperture annulus dannulus"
+from sqlalchemy import (
+    BLOB,
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Index,
+    create_engine,
+    event,
+    select,
+    func,
+)
+from sqlalchemy.orm import (
+    Session,
+    declarative_base,
+    relationship,
+    scoped_session,
+    sessionmaker,
 )
 
+# ----------------------- domain helpers (compat) -----------------------
 
-class Image(object):
-    __slots__ = ("path", "pfilter", "unix_time", "object", "airmass", "gain", "ra", "dec", "sources")
+PhotometricParametersTuple = tuple  # kept for compatibility if needed
 
-    def __init__(
-        self,
-        path: str,
-        pfilter,
-        unix_time: Optional[float],
-        object_: Optional[str],
-        airmass: Optional[float],
-        gain: Optional[float],
-        ra: float,
-        dec: float,
-        sources: int = 0,
-    ):
-        self.path = path
-        self.pfilter = pfilter
-        self.unix_time = unix_time
-        self.object = object_
-        self.airmass = airmass
-        self.gain = gain
-        self.ra = ra
-        self.dec = dec
-        self.sources = int(sources)
+@dataclass
+class PhotometricParameters:
+    aperture: int
+    annulus: int
+    dannulus: int
 
+@dataclass
+class Image:
+    path: str
+    pfilter: Optional[str]
+    unix_time: Optional[float]
+    object: Optional[str]
+    airmass: Optional[float]
+    gain: Optional[float]
+    ra: float
+    dec: float
+    sources: int = 0
 
-class LightCurve(object):
+class LightCurve:
     def __init__(self, pfilter, cstars, cweights, cstdevs, dtype=numpy.longdouble):
         self.pfilter = pfilter
         self.cstars = list(cstars)
@@ -68,8 +88,7 @@ class LightCurve(object):
     @property
     def points(self): return iter(zip(self._times, self._mags, self._snrs))
 
-
-class DBStar(object):
+class DBStar:
     def __init__(self, star_id, pfilter, phot_info, time_index, dtype=numpy.longdouble):
         self.id = int(star_id)
         self.pfilter = pfilter
@@ -86,22 +105,6 @@ class DBStar(object):
         except Exception: return None if val is None else float(val)
     def time(self, idx): return float(self._unix_times[idx])
     def _time_index(self, t): return self._time_indexes[float(t)]
-
-    def _trim_to(self, other: "DBStar") -> "DBStar":
-        keep, t_index = [], {}
-        for t in other._unix_times.tolist():
-            idx = self._time_indexes.get(float(t))
-            if idx is None: continue
-            t_index[float(t)] = len(keep)
-            keep.append(idx)
-        if not keep:
-            return DBStar(self.id, self.pfilter, self._phot_info[:, :0], {}, self.dtype)
-        sub = numpy.empty((3, len(keep)), dtype=self.dtype)
-        sub[0, :] = numpy.array([self._unix_times[i] for i in keep], dtype=self.dtype)
-        sub[1, :] = numpy.array([self._phot_info[1, i] for i in keep], dtype=self.dtype)
-        sub[2, :] = numpy.array([self._phot_info[2, i] for i in keep], dtype=self.dtype)
-        return DBStar(self.id, self.pfilter, sub, t_index, self.dtype)
-
     @classmethod
     def make_star(cls, star_id, pfilter, rows, dtype=numpy.longdouble) -> "DBStar":
         if not rows:
@@ -118,331 +121,557 @@ class DBStar(object):
             t_index[t] = i
         return cls(star_id, pfilter, arr, t_index, dtype)
 
-
 class UnknownStarError(KeyError): pass
 
+# ----------------------- SQLAlchemy ORM models -----------------------
 
-class LEMONdB(object):
-    def __init__(self, path: str, isolation_level: Optional[str] = None, dtype: numpy.longdouble = numpy.longdouble):
+Base = declarative_base()
+
+class PhotometricFilter(Base):
+    __tablename__ = "photometric_filters"
+    id = Column(Integer, primary_key=True)
+    name = Column(Text, unique=True, nullable=False)
+
+class Star(Base):
+    __tablename__ = "stars"
+    id = Column(Integer, primary_key=True)
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
+    ra = Column(Float, nullable=False)
+    dec = Column(Float, nullable=False)
+    epoch = Column(Float, nullable=False)
+    pm_ra = Column(Float)
+    pm_dec = Column(Float)
+    imag = Column(Float, nullable=False)
+
+class ImageRow(Base):
+    __tablename__ = "images"
+    id = Column(Integer, primary_key=True)
+    path = Column(Text, nullable=False)
+    filter_id = Column(Integer, ForeignKey("photometric_filters.id"))
+    unix_time = Column(Float)
+    object = Column(Text)
+    airmass = Column(Float)
+    gain = Column(Float)
+    ra = Column(Float, nullable=False)
+    dec = Column(Float, nullable=False)
+    sources = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("filter_id", "unix_time"),
+        Index("img_by_filter_time", "filter_id", "unix_time"),
+    )
+
+class Photometry(Base):
+    __tablename__ = "photometry"
+    id = Column(Integer, primary_key=True)
+    star_id = Column(Integer, ForeignKey("stars.id"), nullable=False)
+    image_id = Column(Integer, ForeignKey("images.id"), nullable=False)
+    magnitude = Column(Float, nullable=False)
+    snr = Column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("star_id", "image_id"),
+        Index("phot_by_star_image", "star_id", "image_id"),
+        Index("phot_by_image", "image_id"),
+    )
+
+class LightCurveRow(Base):
+    __tablename__ = "light_curves"
+    id = Column(Integer, primary_key=True)
+    star_id = Column(Integer, ForeignKey("stars.id"), nullable=False)
+    image_id = Column(Integer, ForeignKey("images.id"), nullable=False)
+    magnitude = Column(Float, nullable=False)
+    snr = Column(Float)
+
+    __table_args__ = (
+        UniqueConstraint("star_id", "image_id"),
+        Index("curve_by_star_image", "star_id", "image_id"),
+    )
+
+class CmpStar(Base):
+    __tablename__ = "cmp_stars"
+    id = Column(Integer, primary_key=True)
+    star_id = Column(Integer, ForeignKey("stars.id"), nullable=False)
+    filter_id = Column(Integer, ForeignKey("photometric_filters.id"), nullable=False)
+    cstar_id = Column(Integer, ForeignKey("stars.id"), nullable=False)
+    stdev = Column(Float, nullable=False)
+    weight = Column(Float, nullable=False)
+
+    __table_args__ = (
+        Index("cstars_by_star_filter", "star_id", "filter_id"),
+    )
+
+class PhotometricParametersRow(Base):
+    __tablename__ = "photometric_parameters"
+    id = Column(Integer, primary_key=True)
+    aperture = Column(Integer, nullable=False)
+    annulus = Column(Integer, nullable=False)
+    dannulus = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("phot_params_all_rows", "aperture", "annulus", "dannulus"),
+    )
+
+class CandidateParameters(Base):
+    __tablename__ = "candidate_parameters"
+    id = Column(Integer, primary_key=True)
+    pparams_id = Column(Integer, ForeignKey("photometric_parameters.id"), nullable=False)
+    filter_id = Column(Integer, ForeignKey("photometric_filters.id"), nullable=False)
+    stdev = Column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("pparams_id", "filter_id"),
+        Index("cand_filter", "filter_id"),
+    )
+
+class PMCorrection(Base):
+    __tablename__ = "pm_corrections"
+    id = Column(Integer, primary_key=True)
+    star_id = Column(Integer, ForeignKey("stars.id"), nullable=False)
+    image_id = Column(Integer, ForeignKey("images.id"), nullable=False)
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("star_id", "image_id"),
+    )
+
+class RawImage(Base):
+    __tablename__ = "raw_images"
+    id = Column(Integer, ForeignKey("images.id"), primary_key=True)
+    fits = Column(BLOB, nullable=False)
+
+class Metadata(Base):
+    __tablename__ = "metadata"
+    key = Column(Text, primary_key=True)  # UNIQUE(key)
+    value = Column(BLOB)
+
+# ----------------------- DB facade -----------------------
+
+class LEMONSA:
+    """
+    Thread-safe facade around SQLAlchemy ORM.
+    - `scoped_session` gives one Session per thread.
+    - Use `with db.session() as s:` or `db.session()` as a context manager.
+    """
+    def __init__(self, path: str, dtype: numpy.longdouble = numpy.longdouble, echo: bool = False):
         self.path = path
         self.dtype = dtype
-        self.connection = sqlite3.connect(self.path, isolation_level=isolation_level)
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self._cursor = self.connection.cursor()
-        self._rows: Iterable[Tuple] = ()
-        self._simage: Optional[Image] = None
-        self._ensure_schema()
+        self._db_lock = threading.RLock()
 
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb):
-        with contextlib.suppress(Exception): self._cursor.close()
-        with contextlib.suppress(Exception): self.connection.close()
+        self.engine = create_engine(
+            f"sqlite:///{path}",
+            echo=echo,
+            future=True,
+            pool_pre_ping=True,
+        )
 
-    # ---------- schema ----------
-    def _ensure_schema(self):
-        cur = self.connection.cursor()
-        cur.execute("BEGIN")
-        cur.execute("""CREATE TABLE IF NOT EXISTS photometric_filters (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS stars (
-            id INTEGER PRIMARY KEY,x REAL NOT NULL,y REAL NOT NULL,ra REAL NOT NULL,dec REAL NOT NULL,
-            epoch REAL NOT NULL,pm_ra REAL,pm_dec REAL,imag REAL NOT NULL)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS images (
-            id INTEGER PRIMARY KEY,path TEXT NOT NULL,filter_id INTEGER,unix_time REAL,object TEXT,
-            airmass REAL,gain REAL,ra REAL NOT NULL,dec REAL NOT NULL,sources INTEGER NOT NULL,
-            FOREIGN KEY(filter_id) REFERENCES photometric_filters(id),
-            UNIQUE (filter_id, unix_time))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS photometry (
-            star_id INTEGER NOT NULL,image_id INTEGER NOT NULL,magnitude REAL NOT NULL,snr REAL,
-            FOREIGN KEY(star_id) REFERENCES stars(id),FOREIGN KEY(image_id) REFERENCES images(id),
-            UNIQUE (star_id, image_id))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS light_curves (
-            id INTEGER PRIMARY KEY,star_id INTEGER NOT NULL,image_id INTEGER NOT NULL,magnitude REAL NOT NULL,snr REAL,
-            FOREIGN KEY(star_id) REFERENCES stars(id),FOREIGN KEY(image_id) REFERENCES images(id),
-            UNIQUE (star_id, image_id))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS cmp_stars (
-            id INTEGER PRIMARY KEY,star_id INTEGER NOT NULL,filter_id INTEGER NOT NULL,cstar_id INTEGER NOT NULL,
-            stdev REAL NOT NULL,weight REAL NOT NULL,
-            FOREIGN KEY(star_id) REFERENCES stars(id),FOREIGN KEY(filter_id) REFERENCES photometric_filters(id),
-            UNIQUE (star_id, filter_id, cstar_id))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS candidate_pparams (
-            id INTEGER PRIMARY KEY,filter_id INTEGER NOT NULL,aperture REAL NOT NULL,annulus REAL NOT NULL,
-            dannulus REAL NOT NULL,rank INTEGER DEFAULT 0,
-            FOREIGN KEY(filter_id) REFERENCES photometric_filters(id))""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)""")
-        cur.execute("CREATE INDEX IF NOT EXISTS img_by_filter_time ON images(filter_id, unix_time)")
-        cur.execute("CREATE INDEX IF NOT EXISTS phot_by_star_image ON photometry(star_id, image_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS curve_by_star_image ON light_curves(star_id, image_id)")
-        cur.execute("COMMIT")
-
-    # ---------- fast ingest context ----------
-    @contextlib.contextmanager
-    def fast_transaction(self):
-        """Single high-throughput transaction with safe PRAGMA tweaks."""
-        cur = self.connection
-        orig_journal = cur.execute("PRAGMA journal_mode").fetchone()[0]
-        orig_sync = cur.execute("PRAGMA synchronous").fetchone()[0]
-        try:
+        # Set SQLite pragmas per-connection
+        @event.listens_for(self.engine, "connect")
+        def _sqlite_on_connect(dbapi_conn, conn_rec):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA journal_mode=WAL")
-            cur.execute("PRAGMA synchronous=OFF")
-            cur.execute("PRAGMA temp_store=MEMORY")
-            cur.execute("BEGIN IMMEDIATE")
-            yield
-            cur.commit()
-        finally:
-            cur.execute(f"PRAGMA synchronous={orig_sync}")
-            cur.execute(f"PRAGMA journal_mode={orig_journal}")
+            cur.close()
 
-    # ---------- low-level helpers ----------
-    def _execute(self, sql: str, params: Sequence = ()):
-        self._cursor.execute(sql, params)
-        self._rows = self._cursor.fetchall()
-        return self._rows
+        self._SessionFactory = scoped_session(sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False))
+        Base.metadata.create_all(self.engine)
 
-    def commit(self): self.connection.commit()
-    def analyze(self): self.connection.execute("ANALYZE"); self.connection.commit()
+    # ------------- session helpers -------------
+    def session(self) -> Session:
+        """Return the thread-local Session (use as context manager: `with db.session() as s:`)."""
+        return self._SessionFactory()
 
-    # ---------- metadata ----------
-    def _meta_set(self, key, value):
-        self.connection.execute("INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)", (key, str(value)))
+    def close(self):
+        """Close current thread's Session."""
+        with contextlib.suppress(Exception):
+            self._SessionFactory.remove()
+
+    def close_all(self):
+        """Best-effort dispose engine and remove sessions (call when fully shutting down)."""
+        self._SessionFactory.remove()
+        with contextlib.suppress(Exception):
+            self.engine.dispose()
+
+    # ------------- metadata -------------
+    def _meta_set(self, key: str, value):
+        with self.session() as s:
+            row = s.get(Metadata, key)
+            if row is None:
+                s.add(Metadata(key=key, value=value))
+            else:
+                row.value = value
+            s.commit()
+
     @property
-    def date(self): row = self.connection.execute("SELECT value FROM metadata WHERE key='date'").fetchone(); return None if row is None else float(row[0])
+    def date(self):
+        with self.session() as s:
+            row = s.get(Metadata, "date")
+            return None if row is None else float(row.value)
+
     @date.setter
     def date(self, v): self._meta_set("date", v)
+
     @property
-    def author(self): row = self.connection.execute("SELECT value FROM metadata WHERE key='author'").fetchone(); return None if row is None else str(row[0])
+    def author(self):
+        with self.session() as s:
+            row = s.get(Metadata, "author")
+            return None if row is None else (row.value.decode() if isinstance(row.value, (bytes, bytearray)) else str(row.value))
+
     @author.setter
     def author(self, v): self._meta_set("author", v)
+
     @property
-    def hostname(self): row = self.connection.execute("SELECT value FROM metadata WHERE key='hostname'").fetchone(); return None if row is None else str(row[0])
+    def hostname(self):
+        with self.session() as s:
+            row = s.get(Metadata, "hostname")
+            return None if row is None else (row.value.decode() if isinstance(row.value, (bytes, bytearray)) else str(row.value))
+
     @hostname.setter
     def hostname(self, v): self._meta_set("hostname", v)
+
     @property
-    def id(self): row = self.connection.execute("SELECT value FROM metadata WHERE key='id'").fetchone(); return None if row is None else str(row[0])
+    def id(self):
+        with self.session() as s:
+            row = s.get(Metadata, "id")
+            return None if row is None else (row.value.decode() if isinstance(row.value, (bytes, bytearray)) else str(row.value))
+
     @id.setter
     def id(self, v): self._meta_set("id", v)
 
-    # ---------- filters ----------
-    def _get_filter_id(self, pfilter) -> Optional[int]:
-        if pfilter is None: return None
+    # ------------- filters -------------
+    def _get_filter_id(self, pfilter: Optional[str]) -> Optional[int]:
+        if pfilter is None:
+            return None
         name = str(pfilter)
-        row = self.connection.execute("SELECT id FROM photometric_filters WHERE name = ?", (name,)).fetchone()
-        if row: return int(row[0])
-        cur = self.connection.execute("INSERT INTO photometric_filters(name) VALUES (?)", (name,))
-        return int(cur.lastrowid)
+        with self.session() as s:
+            row = s.execute(select(PhotometricFilter).where(PhotometricFilter.name == name)).scalar_one_or_none()
+            if row is None:
+                row = PhotometricFilter(name=name)
+                s.add(row)
+                s.commit()
+                s.refresh(row)
+            return int(row.id)
 
-    def _ensure_filter(self, pfilter):
+    def _ensure_filter(self, pfilter: Optional[str]):
         if pfilter is None: return
-        self.connection.execute("INSERT OR IGNORE INTO photometric_filters(name) VALUES (?)", (str(pfilter),))
+        _ = self._get_filter_id(pfilter)
 
     @property
-    def pfilters(self) -> List[Passband]:
-        rows = self.connection.execute(
-            "SELECT DISTINCT f.name FROM photometric_filters f JOIN images i ON i.filter_id = f.id ORDER BY f.name"
-        ).fetchall()
-        return [Passband(r[0]) for r in rows]
+    def pfilters(self) -> List[str]:
+        with self.session() as s:
+            rows = s.execute(
+                select(PhotometricFilter.name)
+                .join(ImageRow, ImageRow.filter_id == PhotometricFilter.id)
+                .distinct()
+                .order_by(PhotometricFilter.name)
+            ).all()
+            return [r[0] for r in rows]
 
     def filters(self): return list(self.pfilters)
 
-    # ---------- stars ----------
+    # ------------- stars -------------
     @property
     def star_ids(self) -> List[int]:
-        rows = self.connection.execute("SELECT id FROM stars ORDER BY id").fetchall()
-        return [int(r[0]) for r in rows]
+        with self.session() as s:
+            rows = s.execute(select(Star.id).order_by(Star.id)).all()
+            return [int(r[0]) for r in rows]
 
     def nstars(self) -> int:
-        row = self.connection.execute("SELECT COUNT(*) FROM stars").fetchone()
-        return int(row[0]) if row else 0
+        with self.session() as s:
+            return int(s.execute(select(func.count(Star.id))).scalar_one())
 
     def add_star(self, id_, x, y, ra, dec, epoch, pm_ra, pm_dec, imag):
-        self.connection.execute(
-            "INSERT OR REPLACE INTO stars(id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag) VALUES (?,?,?,?,?,?,?,?,?)",
-            (int(id_), float(x), float(y), float(ra), float(dec), float(epoch),
-             None if pm_ra is None else float(pm_ra),
-             None if pm_dec is None else float(pm_dec),
-             float(imag))
-        )
+        with self.session() as s:
+            row = s.get(Star, int(id_))
+            if row is None:
+                row = Star(
+                    id=int(id_), x=float(x), y=float(y), ra=float(ra), dec=float(dec),
+                    epoch=float(epoch),
+                    pm_ra=None if pm_ra is None else float(pm_ra),
+                    pm_dec=None if pm_dec is None else float(pm_dec),
+                    imag=float(imag),
+                )
+                s.add(row)
+            else:
+                row.x=float(x); row.y=float(y); row.ra=float(ra); row.dec=float(dec)
+                row.epoch=float(epoch); row.pm_ra=None if pm_ra is None else float(pm_ra)
+                row.pm_dec=None if pm_dec is None else float(pm_dec); row.imag=float(imag)
+            s.commit()
 
     def get_star(self, star_id):
-        row = self.connection.execute(
-            "SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag FROM stars WHERE id = ?",
-            (int(star_id),)
-        ).fetchone()
-        if not row: raise UnknownStarError(f"star with ID = {star_id} not in database")
-        return row
+        with self.session() as s:
+            row = s.get(Star, int(star_id))
+            if not row: raise UnknownStarError(f"star with ID = {star_id} not in database")
+            return (row.id, row.x, row.y, row.ra, row.dec, row.epoch, row.pm_ra, row.pm_dec, row.imag)
 
-    # ---------- images ----------
+    # ------------- images -------------
     def _get_image_id(self, unix_time: float, pfilter) -> int:
-        row = self.connection.execute(
-            "SELECT img.id FROM images img JOIN photometric_filters f ON img.filter_id = f.id "
-            "WHERE img.unix_time = ? AND f.name = ?",
-            (float(unix_time), str(pfilter)),
-        ).fetchone()
-        if not row:
-            msg = "%.4f (%s) and filter %s"
-            args = unix_time, util.utctime(unix_time), pfilter
-            raise KeyError(msg % args)
-        return int(row[0])
+        with self.session() as s:
+            fid = self._get_filter_id(pfilter)
+            row = s.execute(select(ImageRow.id).where(ImageRow.unix_time == float(unix_time), ImageRow.filter_id == fid)).first()
+            if not row:
+                raise KeyError(f"image not found for time={unix_time} and filter={pfilter}")
+            return int(row[0])
 
     def add_image(self, img: Image):
-        filter_id = None
-        if img.pfilter is not None:
-            self._ensure_filter(img.pfilter)
-            filter_id = self._get_filter_id(img.pfilter)
-        self.connection.execute(
-            "INSERT OR IGNORE INTO images(path, filter_id, unix_time, object, airmass, gain, ra, dec, sources) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (img.path, filter_id,
-             None if img.unix_time is None else float(img.unix_time),
-             img.object,
-             None if img.airmass is None else float(img.airmass),
-             None if img.gain is None else float(img.gain),
-             float(img.ra), float(img.dec), int(img.sources))
-        )
+        with self.session() as s:
+            fid = self._get_filter_id(img.pfilter) if img.pfilter is not None else None
+            # Try find by unique key (filter_id, unix_time) if both present
+            if fid is not None and img.unix_time is not None:
+                row = s.execute(
+                    select(ImageRow).where(ImageRow.filter_id == fid, ImageRow.unix_time == float(img.unix_time))
+                ).scalar_one_or_none()
+            else:
+                row = s.execute(select(ImageRow).where(ImageRow.path == img.path)).scalar_one_or_none()
+
+            if row is None:
+                row = ImageRow(
+                    path=img.path, filter_id=fid,
+                    unix_time=None if img.unix_time is None else float(img.unix_time),
+                    object=img.object,
+                    airmass=None if img.airmass is None else float(img.airmass),
+                    gain=None if img.gain is None else float(img.gain),
+                    ra=float(img.ra), dec=float(img.dec), sources=int(img.sources)
+                )
+                s.add(row)
+            else:
+                row.path = img.path
+                row.filter_id = fid
+                row.unix_time = None if img.unix_time is None else float(img.unix_time)
+                row.object = img.object
+                row.airmass = None if img.airmass is None else float(img.airmass)
+                row.gain = None if img.gain is None else float(img.gain)
+                row.ra = float(img.ra)
+                row.dec = float(img.dec)
+                row.sources = int(img.sources)
+            s.commit()
 
     def get_or_add_image_id(self, img: Image) -> int:
         self.add_image(img)
-        # Prefer key by (filter, time)
-        if img.pfilter is not None and img.unix_time is not None:
-            return self._get_image_id(img.unix_time, img.pfilter)
-        # Fallback by path (should not be used for photometry frames)
-        row = self.connection.execute("SELECT id FROM images WHERE path=? ORDER BY id DESC LIMIT 1", (img.path,)).fetchone()
-        if not row:
-            raise KeyError(f"image not found: {img.path}")
-        return int(row[0])
+        with self.session() as s:
+            if img.pfilter is not None and img.unix_time is not None:
+                fid = self._get_filter_id(img.pfilter)
+                row = s.execute(
+                    select(ImageRow.id).where(ImageRow.filter_id == fid, ImageRow.unix_time == float(img.unix_time))
+                ).first()
+                if row: return int(row[0])
+            row = s.execute(select(ImageRow.id).where(ImageRow.path == img.path).order_by(ImageRow.id.desc())).first()
+            if not row:
+                raise KeyError(f"image not found: {img.path}")
+            return int(row[0])
 
-    # ---------- photometry ----------
+    # ------------- photometry -------------
     def add_photometry(self, star_id, unix_time, pfilter, magnitude, snr):
-        image_id = self._get_image_id(unix_time, pfilter)
-        try:
-            self.connection.execute(
-                "INSERT INTO photometry(star_id, image_id, magnitude, snr) VALUES (?, ?, ?, ?)",
-                (int(star_id), image_id, float(magnitude), None if snr is None else float(snr)),
-            )
-        except sqlite3.IntegrityError:
-            self.connection.execute(
-                "UPDATE photometry SET magnitude=?, snr=? WHERE star_id=? AND image_id=?",
-                (float(magnitude), None if snr is None else float(snr), int(star_id), image_id),
-            )
-        self.connection.execute("UPDATE images SET sources = sources + 1 WHERE id = ?", (image_id,))
+        if snr is None:
+            raise ValueError("photometry.snr is NOT NULL by schema; received None")
+        with self.session() as s:
+            image_id = self._get_image_id(unix_time, pfilter)
+            row = s.execute(select(Photometry).where(
+                Photometry.star_id==int(star_id), Photometry.image_id==image_id
+            )).scalar_one_or_none()
+            if row is None:
+                row = Photometry(star_id=int(star_id), image_id=image_id, magnitude=float(magnitude), snr=float(snr))
+                s.add(row)
+            else:
+                row.magnitude = float(magnitude)
+                row.snr = float(snr)
+            # bump sources
+            img = s.get(ImageRow, image_id)
+            img.sources = int(img.sources) + 1
+            s.commit()
 
-    def add_photometry_bulk(self, rows: List[Tuple[int, int, float, Optional[float]]]):
-        """
-        Bulk upsert photometry.
-        rows: list of (star_id, image_id, magnitude, snr)
-        """
-        if not rows:
-            return
-        # INSERT OR REPLACE emulation: try insert, on conflict update
-        try:
-            self.connection.executemany(
-                "INSERT INTO photometry(star_id, image_id, magnitude, snr) VALUES (?, ?, ?, ?)",
-                [(int(s), int(img), float(m), None if snr is None else float(snr)) for s, img, m, snr in rows],
-            )
-        except sqlite3.IntegrityError:
-            # Fallback path: do updates one-by-one for existing pairs
-            for s, img, m, snr in rows:
-                try:
-                    self.connection.execute(
-                        "INSERT INTO photometry(star_id, image_id, magnitude, snr) VALUES (?, ?, ?, ?)",
-                        (int(s), int(img), float(m), None if snr is None else float(snr)),
-                    )
-                except sqlite3.IntegrityError:
-                    self.connection.execute(
-                        "UPDATE photometry SET magnitude=?, snr=? WHERE star_id=? AND image_id=?",
-                        (float(m), None if snr is None else float(snr), int(s), int(img)),
-                    )
-
-        # Bump images.sources once per image_id
-        cnt = collections.Counter(int(img) for _, img, _, _ in rows)
-        self.connection.executemany(
-            "UPDATE images SET sources = sources + ? WHERE id = ?",
-            [(n, img) for img, n in cnt.items()],
-        )
+    def add_photometry_bulk(self, rows: List[Tuple[int, int, float, float]]):
+        """rows: list of (star_id, image_id, magnitude, snr)"""
+        if not rows: return
+        with self.session() as s:
+            for s_id, img_id, mag, snr in rows:
+                r = s.execute(select(Photometry).where(
+                    Photometry.star_id==int(s_id), Photometry.image_id==int(img_id)
+                )).scalar_one_or_none()
+                if r is None:
+                    s.add(Photometry(star_id=int(s_id), image_id=int(img_id), magnitude=float(mag), snr=float(snr)))
+                else:
+                    r.magnitude=float(mag); r.snr=float(snr)
+            # bump images.sources once per image_id
+            from collections import Counter
+            cnt = Counter(int(img) for _, img, _, _ in rows)
+            for img_id, n in cnt.items():
+                img = s.get(ImageRow, int(img_id))
+                img.sources = int(img.sources) + int(n)
+            s.commit()
 
     def get_photometry(self, star_id: int, pfilter) -> DBStar:
-        rows = self.connection.execute(
-            "SELECT img.unix_time, p.magnitude, p.snr "
-            "FROM photometry p JOIN images img ON p.image_id = img.id "
-            "JOIN photometric_filters f ON img.filter_id = f.id "
-            "WHERE p.star_id = ? AND f.name = ? ORDER BY img.unix_time ASC",
-            (int(star_id), str(pfilter)),
-        ).fetchall()
-        return DBStar.make_star(int(star_id), pfilter, rows, dtype=self.dtype)
+        with self.session() as s:
+            rows = s.execute(
+                select(ImageRow.unix_time, Photometry.magnitude, Photometry.snr)
+                .join(Photometry, Photometry.image_id == ImageRow.id)
+                .join(PhotometricFilter, PhotometricFilter.id == ImageRow.filter_id)
+                .where(Photometry.star_id == int(star_id), PhotometricFilter.name == str(pfilter))
+                .order_by(ImageRow.unix_time.asc())
+            ).all()
+            return DBStar.make_star(int(star_id), pfilter, rows, dtype=self.dtype)
 
-    # ---------- differential curves ----------
+    # ------------- differential curves -------------
     def _add_cmp_star(self, star_id, pfilter, cstar_id, cweight, cstdev):
         if int(star_id) == int(cstar_id):
             raise ValueError(f"star with ID = {star_id} cannot use itself as comparison")
         self._ensure_filter(pfilter)
         fid = self._get_filter_id(pfilter)
-        try:
-            self.connection.execute(
-                "INSERT INTO cmp_stars(star_id, filter_id, cstar_id, stdev, weight) VALUES (?, ?, ?, ?, ?)",
-                (int(star_id), fid, int(cstar_id), float(cstdev), float(cweight)),
-            )
-        except sqlite3.IntegrityError:
-            self.connection.execute(
-                "UPDATE cmp_stars SET stdev=?, weight=? WHERE star_id=? AND filter_id=? AND cstar_id=?",
-                (float(cstdev), float(cweight), int(star_id), fid, int(cstar_id)),
-            )
+        with self.session() as s:
+            row = s.execute(select(CmpStar).where(
+                CmpStar.star_id==int(star_id),
+                CmpStar.filter_id==int(fid),
+                CmpStar.cstar_id==int(cstar_id)
+            )).scalar_one_or_none()
+            if row:
+                row.stdev=float(cstdev); row.weight=float(cweight)
+            else:
+                s.add(CmpStar(star_id=int(star_id), filter_id=int(fid), cstar_id=int(cstar_id),
+                              stdev=float(cstdev), weight=float(cweight)))
+            s.commit()
 
     def add_light_curve(self, star_id: int, curve: LightCurve):
         self._ensure_filter(curve.pfilter)
         for cstar_id, w, sd in zip(curve.cstars, curve.cweights, curve.cstdevs):
             self._add_cmp_star(star_id, curve.pfilter, int(cstar_id), float(w), float(sd))
-        for t, m, s in curve.points:
-            try:
-                image_id = self._get_image_id(t, curve.pfilter)
-            except KeyError:
-                continue
-            try:
-                self.connection.execute(
-                    "INSERT INTO light_curves(star_id, image_id, magnitude, snr) VALUES (?, ?, ?, ?)",
-                    (int(star_id), image_id, float(m), None if s is None else float(s)),
-                )
-            except sqlite3.IntegrityError:
-                self.connection.execute(
-                    "UPDATE light_curves SET magnitude=?, snr=? WHERE star_id=? AND image_id=?",
-                    (float(m), None if s is None else float(s), int(star_id), image_id),
-                )
+        with self.session() as s:
+            fid = self._get_filter_id(curve.pfilter)
+            for t, m, snr in curve.points:
+                # may skip points missing the image row
+                row = s.execute(select(ImageRow.id).where(ImageRow.filter_id==fid, ImageRow.unix_time==float(t))).first()
+                if not row:
+                    continue
+                image_id = int(row[0])
+                lc = s.execute(select(LightCurveRow).where(
+                    LightCurveRow.star_id==int(star_id), LightCurveRow.image_id==image_id
+                )).scalar_one_or_none()
+                if lc:
+                    lc.magnitude=float(m); lc.snr=None if snr is None else float(snr)
+                else:
+                    s.add(LightCurveRow(star_id=int(star_id), image_id=image_id, magnitude=float(m),
+                                        snr=None if snr is None else float(snr)))
+            s.commit()
 
     def get_light_curve(self, star_id: int, pfilter) -> Optional[LightCurve]:
-        pts = self.connection.execute(
-            "SELECT img.unix_time, lc.magnitude, lc.snr "
-            "FROM light_curves lc JOIN images img ON lc.image_id = img.id "
-            "JOIN photometric_filters f ON img.filter_id = f.id "
-            "WHERE lc.star_id = ? AND f.name = ? ORDER BY img.unix_time ASC",
-            (int(star_id), str(pfilter)),
-        ).fetchall()
-        if not pts: return None
-        rows = self.connection.execute(
-            "SELECT cstar_id, weight, stdev FROM cmp_stars cs "
-            "JOIN photometric_filters f ON cs.filter_id = f.id "
-            "WHERE cs.star_id = ? AND f.name = ? ORDER BY cstar_id",
-            (int(star_id), str(pfilter)),
-        ).fetchall()
-        cstars, cweights, cstdevs = zip(*rows) if rows else ([], [], [])
-        lc = LightCurve(pfilter, cstars, cweights, cstdevs, dtype=self.dtype)
-        for t, m, s in pts:
-            lc.add(float(t), float(m), None if s is None else float(s))
-        return lc
+        with self.session() as s:
+            fid = self._get_filter_id(pfilter)
+            pts = s.execute(
+                select(ImageRow.unix_time, LightCurveRow.magnitude, LightCurveRow.snr)
+                .join(LightCurveRow, LightCurveRow.image_id == ImageRow.id)
+                .where(LightCurveRow.star_id == int(star_id), ImageRow.filter_id == fid)
+                .order_by(ImageRow.unix_time.asc())
+            ).all()
+            if not pts: return None
+            rows = s.execute(
+                select(CmpStar.cstar_id, CmpStar.weight, CmpStar.stdev)
+                .where(CmpStar.star_id == int(star_id), CmpStar.filter_id == fid)
+                .order_by(CmpStar.cstar_id.asc())
+            ).all()
+            if rows:
+                cstars, cweights, cstdevs = zip(*rows)
+            else:
+                cstars, cweights, cstdevs = ([], [], [])
+            lc = LightCurve(pfilter, cstars, cweights, cstdevs, dtype=self.dtype)
+            for t, m, snr in pts:
+                lc.add(float(t), float(m), None if snr is None else float(snr))
+            return lc
 
-    # ---------- candidate annuli ----------
-    def add_candidate_pparams(self, cand, pfilter, rank: int = 0):
+    # ------------- photometric parameters & candidates -------------
+    def get_or_create_pparams(self, aperture: int, annulus: int, dannulus: int) -> int:
+        with self.session() as s:
+            row = s.execute(
+                select(PhotometricParametersRow).where(
+                    PhotometricParametersRow.aperture==int(aperture),
+                    PhotometricParametersRow.annulus==int(annulus),
+                    PhotometricParametersRow.dannulus==int(dannulus),
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = PhotometricParametersRow(aperture=int(aperture), annulus=int(annulus), dannulus=int(dannulus))
+                s.add(row); s.commit(); s.refresh(row)
+            return int(row.id)
+
+    def add_candidate_parameters(self, pfilter, pparams_id: int, stdev: float):
         self._ensure_filter(pfilter)
         fid = self._get_filter_id(pfilter)
-        self.connection.execute(
-            "INSERT INTO candidate_pparams(filter_id, aperture, annulus, dannulus, rank) VALUES (?, ?, ?, ?, ?)",
-            (fid, float(cand.aperture), float(cand.annulus), float(cand.dannulus), int(rank)),
-        )
+        with self.session() as s:
+            row = s.execute(select(CandidateParameters).where(
+                CandidateParameters.pparams_id==int(pparams_id),
+                CandidateParameters.filter_id==int(fid)
+            )).scalar_one_or_none()
+            if row:
+                row.stdev=float(stdev)
+            else:
+                s.add(CandidateParameters(pparams_id=int(pparams_id), filter_id=int(fid), stdev=float(stdev)))
+            s.commit()
 
-    # ---------- airmass ----------
+    def add_candidate_parameters_by_values(self, pfilter, aperture: int, annulus: int, dannulus: int, stdev: float) -> int:
+        pid = self.get_or_create_pparams(aperture, annulus, dannulus)
+        self.add_candidate_parameters(pfilter, pid, stdev)
+        return pid
+
+    def candidate_parameters_for_filter(self, pfilter) -> List[Tuple[int, int, int, float]]:
+        fid = self._get_filter_id(pfilter)
+        with self.session() as s:
+            rows = s.execute(
+                select(PhotometricParametersRow.aperture,
+                       PhotometricParametersRow.annulus,
+                       PhotometricParametersRow.dannulus,
+                       CandidateParameters.stdev)
+                .join(CandidateParameters, CandidateParameters.pparams_id == PhotometricParametersRow.id)
+                .where(CandidateParameters.filter_id == fid)
+                .order_by(CandidateParameters.stdev.asc())
+            ).all()
+            return [(int(a), int(b), int(c), float(st)) for a, b, c, st in rows]
+
+    # ------------- pm corrections & raw FITS -------------
+    def set_pm_correction(self, star_id: int, image_id: int, x: float, y: float):
+        with self.session() as s:
+            row = s.execute(select(PMCorrection).where(
+                PMCorrection.star_id==int(star_id), PMCorrection.image_id==int(image_id)
+            )).scalar_one_or_none()
+            if row:
+                row.x=float(x); row.y=float(y)
+            else:
+                s.add(PMCorrection(star_id=int(star_id), image_id=int(image_id), x=float(x), y=float(y)))
+            s.commit()
+
+    def get_pm_correction(self, star_id: int, image_id: int) -> Optional[Tuple[float, float]]:
+        with self.session() as s:
+            row = s.execute(select(PMCorrection.x, PMCorrection.y).where(
+                PMCorrection.star_id==int(star_id), PMCorrection.image_id==int(image_id)
+            )).first()
+            return None if row is None else (float(row[0]), float(row[1]))
+
+    def set_raw_image(self, image_id: int, fits_blob: bytes):
+        with self.session() as s:
+            row = s.get(RawImage, int(image_id))
+            if row is None:
+                s.add(RawImage(id=int(image_id), fits=fits_blob))
+            else:
+                row.fits = fits_blob
+            s.commit()
+
+    def get_raw_image(self, image_id: int) -> Optional[bytes]:
+        with self.session() as s:
+            row = s.get(RawImage, int(image_id))
+            return None if row is None else row.fits
+
+    # ------------- other helpers -------------
     def airmasses(self, pfilter) -> Dict[float, Optional[float]]:
-        rows = self.connection.execute(
-            "SELECT img.unix_time, img.airmass FROM images img "
-            "JOIN photometric_filters f ON img.filter_id = f.id WHERE f.name = ?",
-            (str(pfilter),),
-        ).fetchall()
-        return dict((float(t), None if a is None else float(a)) for t, a in rows)
+        with self.session() as s:
+            rows = s.execute(
+                select(ImageRow.unix_time, ImageRow.airmass)
+                .join(PhotometricFilter, PhotometricFilter.id == ImageRow.filter_id)
+                .where(PhotometricFilter.name == str(pfilter))
+            ).all()
+            return {float(t): (None if a is None else float(a)) for t, a in rows}
+
+    def analyze(self):
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql("ANALYZE")
 
     def __len__(self): return self.nstars()
