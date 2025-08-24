@@ -372,56 +372,33 @@ class LEMONdBMiner:
         return [(r["t"], r["mag"], r["snr"]) for r in rows]
 
     # --- comparison stars -------------------------------------------------
+    def _resolve_filter_id(self, pfilter) -> int:
+        # Accept PFilter, id int, id-as-str, or name like 'R'
+        if hasattr(pfilter, "id"):
+            return int(pfilter.id)
+        try:
+            return int(pfilter)  # handles ints and numeric strings
+        except Exception:
+            pass
+        row = self._conn.execute(
+            "SELECT id FROM photometric_filters WHERE name = ? LIMIT 1",
+            (str(pfilter),),
+        ).fetchone()
+        if not row:
+            raise KeyError(f"Unknown filter: {pfilter!r}")
+        return int(row["id"])
 
     @functools.lru_cache(maxsize=None)
-    def get_cmp_stars(
-        self,
-        star_id: int,
-        pfilter: Union[int, str, PFilter, None] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return comparison stars for the given (star, filter).
-
-        If pfilter is None, the star's dominant filter (most points) is used.
-
-        Each dict has:
-          cstar_id, weight, stdev, ra, dec, imag, filter_id
-
-        Sorted by highest weight, then lowest stdev.
-        """
-        fid = self._resolve_filter_id(pfilter, star_id)
-        if fid is None:
-            return []
-
-        sql = """
-            SELECT
-                cs.cstar_id        AS cstar_id,
-                cs.weight          AS weight,
-                cs.stdev           AS stdev,
-                s.ra               AS ra,
-                s.dec              AS dec,
-                s.imag             AS imag,
-                cs.filter_id       AS filter_id
-            FROM cmp_stars cs
-            JOIN stars s ON s.id = cs.cstar_id
-            WHERE cs.star_id = ? AND cs.filter_id = ?
-            ORDER BY cs.weight DESC, cs.stdev ASC, cs.cstar_id ASC
-        """
-        rows = self._conn.execute(sql, (int(star_id), int(fid))).fetchall()
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            out.append(
-                {
-                    "cstar_id": int(r["cstar_id"]),
-                    "weight": float(r["weight"]),
-                    "stdev": float(r["stdev"]),
-                    "ra": float(r["ra"]),
-                    "dec": float(r["dec"]),
-                    "imag": float(r["imag"]),
-                    "filter_id": int(r["filter_id"]),
-                }
-            )
-        return out
+    def get_cmp_stars(self, star_id: int, pfilter) -> list[tuple[int, float, float]]:
+        fid = self._resolve_filter_id(pfilter)
+        rows = self._conn.execute(
+            "SELECT cstar_id, weight, stdev "
+            "FROM cmp_stars "
+            "WHERE star_id = ? AND filter_id = ? "
+            "ORDER BY weight DESC, stdev ASC",
+            (int(star_id), fid),
+        ).fetchall()
+        return [(int(r["cstar_id"]), float(r["weight"]), float(r["stdev"])) for r in rows]
 
     # --- (optional) periods hook -----------------------------------------
 

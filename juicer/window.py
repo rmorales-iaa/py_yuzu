@@ -544,7 +544,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"LEMON juicer ? {Path(db_path).name}")
+        self.set_title(f"yuzu juicer {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
         self._populate_overview_from_miner(miner)
 
