@@ -41,7 +41,7 @@ _BLUE_HDR  = _cfg_get("theme", "blue",       "#0d6efd")
 _MONO_FONT = _cfg_get("theme", "mono_font",
                       "JetBrains Mono, Fira Mono, Menlo, Consolas, monospace")
 
-# Table section (NEW)
+# Table section
 _HDR_BG     = _cfg_get("curve_points_table", "header_bg",  "#b85c00")
 _HDR_FG     = _cfg_get("curve_points_table", "header_fg",  "#ffffff")
 _GRID_COLOR = _cfg_get("curve_points_table", "grid_color", "#c9a000")
@@ -114,15 +114,20 @@ class CurvePointsTable(Gtk.Box):
     """
     4-column table in a framed section with blue title:
       ID | date | magnitude | SNR
+
     API:
         clear()
-        set_rows(rows)  # rows: Iterable[(idx, t, mag, snr)]
-                        #   t: epoch seconds (float/int) or str
+        set_rows(rows)           # rows: Iterable[(idx, t, mag, snr)]
+                                 #   t: epoch seconds (float/int) or str
+        select_and_scroll(pos)   # safely select & scroll
+        scroll_to(pos)           # safely scroll only
     """
     def __init__(self, title: str = "Data points") -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         _install_css()
         self.add_css_class("lemon-surface")
+
+        self._last_pos: int = 0
 
         # Section header (blue)
         header_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -193,22 +198,95 @@ class CurvePointsTable(Gtk.Box):
         factory.connect("setup", setup)
         factory.connect("bind", bind)
 
-        selection = Gtk.NoSelection.new(self._store)
-        list_view = Gtk.ListView.new(selection, factory)
-        list_view.add_css_class("lemon-surface")
-        list_view.set_vexpand(True)
+        # Use SingleSelection so we can keep/restore selection robustly
+        self._selection: Gtk.SingleSelection = Gtk.SingleSelection.new(self._store)  # type: ignore
+        self._selection.set_can_unselect(False)
+        self._selection.connect("notify::selected", self._on_selected_changed)
+
+        self._list_view: Gtk.ListView = Gtk.ListView.new(self._selection, factory)
+        self._list_view.add_css_class("lemon-surface")
+        self._list_view.set_vexpand(True)
+
+        # Keep selection sane on data changes
+        self._store.connect("items-changed", self._on_items_changed)
 
         sc = Gtk.ScrolledWindow.new()
-        sc.set_child(list_view)
+        sc.set_child(self._list_view)
         sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sc.add_css_class("lemon-surface")
         sc.set_hexpand(True); sc.set_vexpand(True)
 
         frame_box.append(sc)
 
+    # ---- Helpers: selection/scroll clamped & safe
+
+    def _count(self) -> int:
+        try:
+            return int(self._store.get_n_items())
+        except Exception:
+            return 0
+
+    def _clamp(self, pos: int) -> int:
+        n = self._count()
+        if n <= 0:
+            return 0
+        return max(0, min(int(pos), n - 1))
+
+    def _safe_scroll(self, pos: int) -> None:
+        n = self._count()
+        if n <= 0:
+            return
+        pos = self._clamp(pos)
+        # Gtk.ListView.scroll_to(position, flags, Rect?) ? keep it simple
+        try:
+            self._list_view.scroll_to(pos, Gtk.ListScrollFlags.NONE, None)
+        except Exception:
+            # Nothing else we can safely do here
+            pass
+
+    def _safe_select(self, pos: int) -> None:
+        n = self._count()
+        if n <= 0:
+            return
+        pos = self._clamp(pos)
+        try:
+            self._selection.set_selected(pos)
+            self._last_pos = pos
+        except Exception:
+            pass
+
+    def select_and_scroll(self, pos: int) -> None:
+        """Public API: safely select row and scroll to it."""
+        n = self._count()
+        if n <= 0:
+            return
+        pos = self._clamp(pos)
+        self._safe_select(pos)
+        self._safe_scroll(pos)
+
+    def scroll_to(self, pos: int) -> None:
+        """Public API: safely scroll without changing selection."""
+        self._safe_scroll(pos)
+
+    # ---- Signals
+
+    def _on_selected_changed(self, *_args) -> None:
+        sel = self._selection.get_selected()
+        if sel >= 0:
+            self._last_pos = int(sel)
+
+    def _on_items_changed(self, *_args) -> None:
+        # After inserts/removals keep selection within range
+        n = self._count()
+        if n <= 0:
+            return
+        self.select_and_scroll(self._last_pos)
+
     # ---- API
+
     def clear(self) -> None:
         self._store.splice(0, self._store.get_n_items(), [])
+        self._last_pos = 0
 
     def _fmt_time(self, t: Union[str, float, int]) -> str:
         if isinstance(t, str):
@@ -216,21 +294,35 @@ class CurvePointsTable(Gtk.Box):
         try:
             return _dt.datetime.utcfromtimestamp(float(t)).strftime(_DATE_FMT)
         except Exception:
-            return f"{float(t):.6f}"
+            try:
+                return f"{float(t):.6f}"
+            except Exception:
+                return str(t)
 
-    def set_rows(self, rows: Iterable[Tuple[int, Union[str, float, int], float, Optional[float]]]) -> None:
-        self.clear()
+    def set_rows(
+        self,
+        rows: Iterable[Tuple[int, Union[str, float, int], float, Optional[float]]]
+    ) -> None:
+        """Bulk update rows and restore previous selection safely."""
+        items: list[CurveRow] = []
         for idx, t, mag, snr in rows:
             dt = self._fmt_time(t)
             try:
-                mag_str = f"{float(mag):.{int(_MAG_DEC)}f}"
+                mag_str = f"{float(mag):.{_MAG_DEC}f}"
             except Exception:
                 mag_str = str(mag)
             if snr is None:
-                snr_str = "—"
+                snr_str = "?"
             else:
                 try:
-                    snr_str = f"{float(snr):.{int(_SNR_DEC)}f}"
+                    snr_str = f"{float(snr):.{_SNR_DEC}f}"
                 except Exception:
                     snr_str = str(snr)
-            self._store.append(CurveRow(int(idx), dt, mag_str, snr_str))
+            items.append(CurveRow(int(idx), dt, mag_str, snr_str))
+
+        # splice in one go (fast, avoids multiple "items-changed")
+        self._store.splice(0, self._store.get_n_items(), items)
+
+        # restore (or pick first) safely
+        if self._count() > 0:
+            self.select_and_scroll(self._last_pos)
