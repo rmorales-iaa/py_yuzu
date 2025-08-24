@@ -1,566 +1,454 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple, Dict, Any
-
-"""
-LEMON data-mining helpers.
-
-This module implements several data mining and data analysis algorithms to
-identify potentially interesting objects, such as those whose light curves are
-strongly correlated across photometric filters or stars with the lowest light
-curve standard deviation (i.e., the most constant).
-
-It builds on top of the read-only `database.LEMONdB` interface and memoizes
-expensive calls there to avoid redundant I/O/CPU work.
-"""
-
-import collections
-import datetime
-import itertools
-import operator
 import functools
-
-import numpy as np
-from scipy.stats import linregress
-
-# Project modules (prefer relative import; fall back to absolute if needed)
-try:
-    from . import database, util
-except Exception:  # pragma: no cover
-    import database  # type: ignore
-    import util      # type: ignore
-
-__all__ = ["NoStarsSelectedError", "LEMONdBMiner"]
+import logging
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["NoStarsSelectedError", "PFilter", "LEMONdBMiner"]
 
 
 class NoStarsSelectedError(ValueError):
     """Raised when no stars satisfy the selection criteria in LEMONdBMiner."""
 
 
-class LEMONdBMiner(database.LEMONdB):
+@dataclass(frozen=True)
+class PFilter:
+    id: int
+    name: str  # e.g., "R", "UNKNOWN"
+
+
+class LEMONdBMiner:
     """
-    Read-only, memoized interface to identify potentially interesting stars.
+    Read-only miner for a LEMON-like SQLite database.
 
-    Databases accessed through this class are expected to be read-only; methods
-    that are heavy in I/O/CPU in the parent class are memoized. Mutating the
-    underlying LEMONdB concurrently would risk stale reads.
+    Robust to DBs that lack a `photometry` table:
+    - If `photometry` is missing but `light_curves` exists, we auto-create a
+      compatibility layer:
+        * Prefer a VIEW `photometry` mapped from `light_curves` (with an `id`)
+        * Fallback to MATERIALIZE a real `photometry` TABLE populated from `light_curves`
+      This keeps downstream UI/queries that rely on `photometry` working.
+
+    Public surface:
+      - .pfilters -> List[PFilter]
+      - .star_ids -> List[int]
+      - .get_star(star_id) -> dict with at least {ra, dec, imag}
+      - .get_light_curve(star_id, pfilter) -> List[(unix_time, magnitude, snr)]
+      - .get_cmp_stars(star_id, pfilter=None) -> comparison stars for a star/filter
+      - .field_name -> file name of the DB (for status bar)
     """
 
-    # ---- Memoized pass-throughs to the base database API --------------------
-    @functools.lru_cache(maxsize=None)
-    def get_star(self, *args):
-        return super(LEMONdBMiner, self).get_star(*args)
+    # ------------------------- lifecycle -------------------------
 
-    @functools.lru_cache(maxsize=None)
-    def get_light_curve(self, *args):
-        return super(LEMONdBMiner, self).get_light_curve(*args)
+    def __init__(self, db_path: Union[str, Path]):
+        self.db_path = str(db_path)
+        self._conn: sqlite3.Connection = sqlite3.connect(self.db_path)
+        self._conn.row_factory = sqlite3.Row
 
-    @functools.lru_cache(maxsize=None)
-    def get_period(self, *args):
-        return super(LEMONdBMiner, self).get_period(*args)
+        # Ensure compatibility when photometry is absent
+        self._ensure_photometry_compat()
 
-    # ---- Utilities -----------------------------------------------------------
-    @staticmethod
-    def _ascii_table(
-        headers: Sequence[str],
-        table_rows: Sequence[Sequence[Any]],
-        *,
-        sort_index: Optional[int] = 1,
-        descending: bool = True,
-        ndecimals: int = 8,
-        dates_columns: Optional[Sequence[int]] = None,
-    ) -> str:
-        """
-        Format `table_rows` as a simple ASCII table.
+        self._has_photometry = self._table_has_rows("photometry")
+        self._has_light_curves = self._table_has_rows("light_curves")
 
-        Notes
-        -----
-        - A leftmost index column is automatically added (starting at 0).
-        - `dates_columns` contains column indexes (0-based *in the input rows*)
-          that represent durations in seconds and should be rendered as
-          timedeltas (e.g., '0:11:06' or '17 days, 6:12:00').
-        - `sort_index` is applied to the *input* columns (not counting the index
-          column we add).
-        """
-        dates_columns = tuple(dates_columns or ())
-        rows = [tuple(r) for r in table_rows]  # avoid mutating caller data
+        self._pfilters: List[PFilter] = []
+        self._star_ids: List[int] = []
+        self._filter_by_id: Dict[int, PFilter] = {}
+        self._filter_by_name: Dict[str, PFilter] = {}
 
-        if not rows:
-            # produce just a header-only table
-            effective_columns = [""] + list(headers)
-            header_str = "|".join(s.center(len(s) + 2) for s in effective_columns)
-            return header_str + "\n" + "-" * len(header_str) + "\n"
+        self.field_name = Path(self.db_path).name
+        self._build_index()
 
-        ncols = len(rows[0])
-        if any(len(r) != ncols for r in rows):
-            raise ValueError("All rows must have the same number of columns.")
-        if len(headers) != ncols:
-            raise ValueError("Headers length must match the number of columns.")
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
-        # Sort copy of rows by requested input column (if any)
-        if sort_index is not None:
-            rows = sorted(rows, key=operator.itemgetter(sort_index), reverse=descending)
+    # -------------------------- helpers --------------------------
 
-        # Prepare a 2D dict of strings: table_data[row_idx][col_idx]
-        table_data: Dict[int, Dict[int, str]] = collections.defaultdict(dict)
-
-        # Top-left corner cell is empty; first row are headers (shifted by 1)
-        table_data[0][0] = ""
-        for c, name in enumerate(headers, start=1):
-            table_data[0][c] = str(name)
-
-        # Data rows: first column is the index (as string)
-        for r_idx, row in enumerate(rows, start=1):
-            table_data[r_idx][0] = str(r_idx - 1)
-            for c_idx, value in enumerate(row, start=1):
-                if value is None:
-                    cell = ""
-                elif (c_idx - 1) in dates_columns:
-                    try:
-                        cell = str(datetime.timedelta(seconds=float(value)))
-                    except Exception:
-                        cell = str(value)
-                elif isinstance(value, float):
-                    cell = f"{value:.{ndecimals}f}"
-                else:
-                    cell = str(value)
-                table_data[r_idx][c_idx] = cell
-
-        # Column widths (with padding), and data widths (exclude header)
-        widths: Dict[int, int] = {}
-        data_widths: Dict[int, int] = {}
-        for c in table_data[0].keys():
-            col_vals = [table_data[r].get(c, "") for r in table_data.keys()]
-            lengths = [len(str(x)) for x in col_vals]
-            widths[c] = (max(lengths) if lengths else 0) + 2
-            data_only = [len(str(x)) for x in col_vals[1:]] or [0]
-            data_widths[c] = max(data_only)
-
-        # Header row
-        header_values = [table_data[0][c] for c in sorted(table_data[0])]
-        header_str = "|".join(
-            s.center(widths[c]) for c, s in enumerate(header_values)
+    def _table_or_view_exists(self, name: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name=?",
+            (name,),
         )
-        out = header_str + "\n" + "-" * len(header_str) + "\n"
+        return cur.fetchone() is not None
 
-        # Data rows
-        for r in sorted(k for k in table_data.keys() if k != 0):
-            row_vals = [table_data[r][c] for c in sorted(table_data[r])]
-            # First cell (index) is left-justified within data width, centered overall
-            left = row_vals[0].ljust(data_widths[0]).center(widths[0])
-            out += left + "|"
-            # Remaining cells right-justified within data width, centered overall
-            rendered = []
-            for c, s in enumerate(row_vals[1:], start=1):
-                rendered.append(s.rjust(data_widths[c]).center(widths[c]))
-            out += "|".join(rendered) + "\n"
+    def _table_exists(self, name: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        )
+        return cur.fetchone() is not None
 
+    def _view_exists(self, name: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='view' AND name=?",
+            (name,),
+        )
+        return cur.fetchone() is not None
+
+    def _table_has_rows(self, name: str) -> bool:
+        if not self._table_or_view_exists(name):
+            return False
+        try:
+            cur = self._conn.execute(f"SELECT 1 FROM {name} LIMIT 1")
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def _sqlite_version_tuple(self) -> Tuple[int, int, int]:
+        v = self._conn.execute("SELECT sqlite_version()").fetchone()[0]
+        parts = []
+        for tok in str(v).split("."):
+            try:
+                parts.append(int(tok))
+            except Exception:
+                parts.append(0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])  # type: ignore[return-value]
+
+    def _ensure_photometry_compat(self) -> None:
+        """
+        If `photometry` doesn't exist but `light_curves` does, create a
+        compatibility layer so code that expects `photometry` keeps working.
+
+        Preference:
+          1) Create a VIEW `photometry` selecting from `light_curves` with a ROW_NUMBER() id
+             (requires SQLite >= 3.25).
+          2) Else materialize a TABLE `photometry` and bulk-copy from `light_curves`.
+        """
+        has_photometry = self._table_or_view_exists("photometry")
+        has_light_curves = self._table_or_view_exists("light_curves")
+        if has_photometry or not has_light_curves:
+            return  # nothing to do
+
+        major, minor, patch = self._sqlite_version_tuple()
+        can_row_number = (major, minor, patch) >= (3, 25, 0)
+
+        try:
+            if can_row_number:
+                # Try to create a compatibility VIEW with an id
+                self._conn.execute("DROP VIEW IF EXISTS photometry")
+                self._conn.execute(
+                    """
+                    CREATE VIEW photometry AS
+                    SELECT
+                        ROW_NUMBER() OVER ()            AS id,
+                        lc.star_id                      AS star_id,
+                        lc.image_id                     AS image_id,
+                        lc.magnitude                    AS magnitude,
+                        COALESCE(lc.snr, 0.0)           AS snr
+                    FROM light_curves lc
+                    """
+                )
+                # Optional: create indexes on the underlying tables already exist;
+                # view indices aren't a thing, but keeping parity with names helps external code.
+                logger.info("Created compatibility VIEW 'photometry' from 'light_curves'.")
+            else:
+                # Materialize a real table with sane schema and indexes
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS photometry (
+                      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                      star_id   INTEGER NOT NULL,
+                      image_id  INTEGER NOT NULL,
+                      magnitude REAL    NOT NULL,
+                      snr       REAL    NOT NULL,
+                      UNIQUE (star_id, image_id)
+                    )
+                    """
+                )
+                # Populate from light_curves
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO photometry (star_id, image_id, magnitude, snr)
+                    SELECT lc.star_id, lc.image_id, lc.magnitude, COALESCE(lc.snr, 0.0)
+                    FROM light_curves lc
+                    """
+                )
+                # Add expected indexes (names match common conventions)
+                self._conn.execute("CREATE INDEX IF NOT EXISTS phot_by_star_image ON photometry(star_id, image_id)")
+                self._conn.execute("CREATE INDEX IF NOT EXISTS phot_by_image ON photometry(image_id)")
+                self._conn.commit()
+                logger.info("Materialized TABLE 'photometry' from 'light_curves'.")
+        except Exception as e:
+            # If anything goes wrong, log but allow miner to fall back to `light_curves`
+            logger.warning("Failed to create photometry compatibility layer: %s", e)
+
+    def _measurement_table(self) -> Optional[str]:
+        if self._table_has_rows("photometry"):
+            return "photometry"
+        if self._table_has_rows("light_curves"):
+            return "light_curves"
+        return None
+
+    def _build_index(self) -> None:
+        """
+        Populate self._pfilters and self._star_ids without ever requiring a
+        'photometry' table. Prefer light_curves; fall back to images/stars.
+        """
+        self._pfilters = []
+        self._star_ids = []
+
+        has_lc = self._table_has_rows("light_curves")
+        has_images = self._table_has_rows("images")
+        has_filters = self._table_has_rows("photometric_filters")
+        has_stars = self._table_has_rows("stars")
+
+        # 1) Filters actually used by images that have light-curve measurements
+        if has_lc and has_images and has_filters:
+            sql_pf_from_lc = """
+                SELECT DISTINCT pf.id, pf.name
+                FROM light_curves lc
+                JOIN images i   ON i.id = lc.image_id
+                JOIN photometric_filters pf ON pf.id = i.filter_id
+                WHERE i.filter_id IS NOT NULL
+                ORDER BY pf.id
+            """
+            self._pfilters = [PFilter(r["id"], r["name"]) for r in self._conn.execute(sql_pf_from_lc)]
+
+        # 1b) Fallback: any filters referenced by images at all
+        if not self._pfilters and has_images and has_filters:
+            sql_pf_from_images = """
+                SELECT DISTINCT pf.id, pf.name
+                FROM images i
+                JOIN photometric_filters pf ON pf.id = i.filter_id
+                WHERE i.filter_id IS NOT NULL
+                ORDER BY pf.id
+            """
+            self._pfilters = [PFilter(r["id"], r["name"]) for r in self._conn.execute(sql_pf_from_images)]
+
+        # 1c) Last resort: list all filter rows (keeps UI usable even if images lack filter_id)
+        if not self._pfilters and has_filters:
+            sql_all_pf = "SELECT id, name FROM photometric_filters ORDER BY id"
+            self._pfilters = [PFilter(r["id"], r["name"]) for r in self._conn.execute(sql_all_pf)]
+
+        # Build quick lookups
+        self._filter_by_id = {pf.id: pf for pf in self._pfilters}
+        self._filter_by_name = {pf.name: pf for pf in self._pfilters}
+
+        # 2) Stars: prefer those that actually have measurements in light_curves
+        if has_lc:
+            sql_star_ids = "SELECT DISTINCT star_id FROM light_curves ORDER BY star_id"
+            self._star_ids = [r["star_id"] for r in self._conn.execute(sql_star_ids)]
+
+        # 2b) Fallback: all cataloged stars
+        if not self._star_ids and has_stars:
+            sql_all_stars = "SELECT id FROM stars ORDER BY id"
+            self._star_ids = [r["id"] for r in self._conn.execute(sql_all_stars)]
+
+        # If still nothing, make it explicit so callers can react cleanly
+        if not self._star_ids:
+            raise NoStarsSelectedError("No stars found (no light_curves and no stars).")
+
+        # Clear caches that depend on index contents
+        try:
+            self.get_star.cache_clear()  # type: ignore[attr-defined]
+            self.get_light_curve.cache_clear()  # type: ignore[attr-defined]
+            self.get_cmp_stars.cache_clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    # ---------------------- public attributes --------------------
+
+    @property
+    def pfilters(self) -> List[PFilter]:
+        return self._pfilters
+
+    @property
+    def star_ids(self) -> List[int]:
+        return self._star_ids
+
+    # ----------------------- read operations ---------------------
+
+    @functools.lru_cache(maxsize=None)
+    def get_star(self, star_id: int) -> Dict[str, Any]:
+        """
+        Return a dict with at least: ra, dec, imag.
+        More keys are harmless and often handy for future views.
+        """
+        sql = """
+            SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag
+            FROM stars WHERE id = ?
+        """
+        row = self._conn.execute(sql, (int(star_id),)).fetchone()
+        if row is None:
+            raise KeyError(f"Star {star_id} not found")
+        return {
+            "id": row["id"],
+            "x": row["x"],
+            "y": row["y"],
+            "ra": row["ra"],
+            "dec": row["dec"],
+            "epoch": row["epoch"],
+            "pm_ra": row["pm_ra"],
+            "pm_dec": row["pm_dec"],
+            "imag": row["imag"],
+        }
+
+    def _resolve_filter_id(self, pfilter: Union[int, str, PFilter, None], star_id: int) -> Optional[int]:
+        """
+        Resolve arbitrary pfilter spec to a concrete filter_id.
+        If None, choose the star's dominant filter (most points).
+        """
+        if pfilter is None:
+            return self._dominant_filter_id_for_star(star_id)
+
+        if isinstance(pfilter, PFilter):
+            return int(pfilter.id)
+
+        if isinstance(pfilter, str):
+            pf = self._filter_by_name.get(pfilter)
+            if pf is not None:
+                return int(pf.id)
+            try:
+                fid = int(pfilter)
+                return fid if (fid in self._filter_by_id or not self._filter_by_id) else None
+            except Exception:
+                return None
+
+        try:
+            return int(pfilter)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    def _dominant_filter_id_for_star(self, star_id: int) -> Optional[int]:
+        """
+        Return the filter_id where this star has the most measurements,
+        using whichever measurement table is available.
+        """
+        meas = self._measurement_table()
+        if meas is None:
+            return None
+
+        sql = f"""
+            SELECT i.filter_id AS fid, COUNT(*) AS n
+            FROM {meas} m
+            JOIN images i ON i.id = m.image_id
+            WHERE m.star_id = ?
+            GROUP BY i.filter_id
+            ORDER BY n DESC
+            LIMIT 1
+        """
+        row = self._conn.execute(sql, (int(star_id),)).fetchone()
+        if row and row["fid"] is not None:
+            return int(row["fid"])
+        return None
+
+    @functools.lru_cache(maxsize=None)
+    def get_light_curve(self, star_id: int, pfilter: Union[int, str, PFilter]) -> List[Tuple[float, float, float]]:
+        """
+        Return a list of (unix_time, magnitude, snr) triples for the given star
+        and filter. Uses `photometry` if present (or compat), otherwise `light_curves`.
+        """
+        fid = self._resolve_filter_id(pfilter, star_id)
+        if fid is None:
+            return []
+
+        meas = self._measurement_table()
+        if meas is None:
+            return []
+
+        # Filter out NULL unix_time for plotting/UI sanity
+        sql = f"""
+            SELECT i.unix_time AS t,
+                   m.magnitude  AS mag,
+                   COALESCE(m.snr, 0.0) AS snr
+            FROM {meas} m
+            JOIN images i ON i.id = m.image_id
+            WHERE m.star_id = ?
+              AND i.filter_id = ?
+              AND i.unix_time IS NOT NULL
+            ORDER BY i.unix_time
+        """
+        rows = self._conn.execute(sql, (int(star_id), int(fid))).fetchall()
+        return [(r["t"], r["mag"], r["snr"]) for r in rows]
+
+    # --- comparison stars -------------------------------------------------
+
+    @functools.lru_cache(maxsize=None)
+    def get_cmp_stars(
+        self,
+        star_id: int,
+        pfilter: Union[int, str, PFilter, None] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return comparison stars for the given (star, filter).
+
+        If pfilter is None, the star's dominant filter (most points) is used.
+
+        Each dict has:
+          cstar_id, weight, stdev, ra, dec, imag, filter_id
+
+        Sorted by highest weight, then lowest stdev.
+        """
+        fid = self._resolve_filter_id(pfilter, star_id)
+        if fid is None:
+            return []
+
+        sql = """
+            SELECT
+                cs.cstar_id        AS cstar_id,
+                cs.weight          AS weight,
+                cs.stdev           AS stdev,
+                s.ra               AS ra,
+                s.dec              AS dec,
+                s.imag             AS imag,
+                cs.filter_id       AS filter_id
+            FROM cmp_stars cs
+            JOIN stars s ON s.id = cs.cstar_id
+            WHERE cs.star_id = ? AND cs.filter_id = ?
+            ORDER BY cs.weight DESC, cs.stdev ASC, cs.cstar_id ASC
+        """
+        rows = self._conn.execute(sql, (int(star_id), int(fid))).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "cstar_id": int(r["cstar_id"]),
+                    "weight": float(r["weight"]),
+                    "stdev": float(r["stdev"]),
+                    "ra": float(r["ra"]),
+                    "dec": float(r["dec"]),
+                    "imag": float(r["imag"]),
+                    "filter_id": int(r["filter_id"]),
+                }
+            )
         return out
 
-    # ---- Analyses ------------------------------------------------------------
-    def sort_by_period_similarity(
-        self,
-        minimum: int = 2,
-        normalization: str = "max",
-    ) -> List[Tuple[int, float]]:
+    # --- (optional) periods hook -----------------------------------------
+
+    @functools.lru_cache(maxsize=None)
+    def get_period(self, star_id: int, pfilter: Union[int, str, PFilter]) -> Optional[float]:
         """
-        Sort stars by the similarity (low scatter) of their periods across filters.
-
-        The similarity is measured as the standard deviation of per-filter
-        periods after normalizing them for each star.
-
-        Parameters
-        ----------
-        minimum : int
-            Require at least this many known periods for the star.
-        normalization : {"max", "median", "mean"}
-            Normalization applied to the vector of periods before computing stdev.
-
-        Returns
-        -------
-        list[tuple[star_id, stdev]]
-            Sorted ascending by stdev.
-
-        Raises
-        ------
-        ValueError
-            If `minimum < 2` or `normalization` is unknown.
-        NoStarsSelectedError
-            If no stars satisfy the constraints.
-        """
-        if minimum < 2:
-            raise ValueError("A minimum of at least two periods is required.")
-
-        if normalization == "max":
-            norm_func = np.max
-        elif normalization == "mean":
-            norm_func = np.mean
-        elif normalization == "median":
-            norm_func = np.median
-        else:
-            raise ValueError("Unrecognized normalization method: %r" % normalization)
-
-        periods_stdevs: List[Tuple[int, float]] = []
-        for star_id in self.star_ids:
-            star_periods = self.get_periods(star_id)  # type: ignore[attr-defined]
-            if len(star_periods) < minimum:
-                continue
-
-            normalized = star_periods / norm_func(star_periods)
-            stdev = float(np.std(normalized, dtype=self.dtype))  # dtype from base class
-            periods_stdevs.append((star_id, stdev))
-
-        if not periods_stdevs:
-            raise NoStarsSelectedError(f"no stars with at least {minimum} known periods")
-
-        return sorted(periods_stdevs, key=operator.itemgetter(1))
-
-    def period_similarity(
-        self,
-        how_many: int,
-        *,
-        minimum: int = 2,
-        normalization: str = "max",
-        ndecimals: int = 8,
-    ) -> str:
-        """
-        Return an ASCII table with the `how_many` stars with the most similar periods.
-
-        See `sort_by_period_similarity` for details.
-        """
-        most_similar = self.sort_by_period_similarity(
-            normalization=normalization, minimum=minimum
-        )[:how_many]
-
-        header: List[str] = ["Star", "Stdev. Norm."] + [f"Period {pf.letter}" for pf in self.pfilters]
-
-        table_rows: List[List[Optional[float]]] = []
-        for star_id, stdev in most_similar:
-            row: List[Optional[float]] = [star_id, stdev]
-            for pf in self.pfilters:
-                period = self.get_period(star_id, pf)
-                if period is None:
-                    row.append(None)
-                else:
-                    period_secs, _step_secs = period
-                    row.append(period_secs)
-            table_rows.append(row)
-
-        # NB: the positions 2,3,4,... with durations depend on number of filters;
-        # we mark all those 'Period *' columns as date-like (seconds).
-        date_cols = tuple(range(2, 2 + len(self.pfilters)))
-        return self._ascii_table(
-            header,
-            table_rows,
-            sort_index=1,
-            descending=False,
-            ndecimals=ndecimals,
-            dates_columns=date_cols,
-        )
-
-    def match_bands(
-        self,
-        star_id: int,
-        first_pfilter,
-        second_pfilter,
-        *,
-        delta: float = 3600 * 1.5,
-    ) -> Optional[List[Tuple[float, float]]]:
-        """
-        Pair magnitudes from two light curves of the same star (nearest in time).
-
-        Only pairs with |Δt| < delta seconds are retained.
-
-        Returns
-        -------
-        list[(mag1, mag2)] or None
+        Placeholder for per-star period retrieval if/when you store them.
+        Return None if not available.
         """
         try:
-            phot1_points = list(self.get_light_curve(star_id, first_pfilter))
-            phot2_points = list(self.get_light_curve(star_id, second_pfilter))
-        except TypeError:
-            return None  # no curve in one/both filters
-
-        if not phot1_points or not phot2_points:
+            if not self._table_or_view_exists("candidate_parameters"):
+                return None
+            # Adapt this to your actual period storage if/when you add it.
+            return None
+        except Exception:
             return None
 
-        matches: List[Tuple[float, float]] = []
-        for t1, mag1, _snr1 in phot1_points:
-            # Find closest time in second curve (ValueError on empty guarded above)
-            t2, mag2, _snr2 = min(phot2_points, key=lambda x: abs(t1 - x[0]))
-            if abs(t1 - t2) < delta:
-                matches.append((mag1, mag2))
-        return matches
+    # --------------------------- utils ---------------------------
 
-    def star_correlation(
-        self,
-        star_id: int,
-        first_pfilter,
-        second_pfilter,
-        *,
-        min_matches: int = 10,
-        delta: float = 3600 * 1.5,
-    ) -> Optional[Tuple[int, float, float, int]]:
-        """
-        Correlate two filters for a star using least-squares regression.
-
-        Returns
-        -------
-        (star_id, slope, r_value, n_matches) or None
-        """
-        matches = self.match_bands(star_id, first_pfilter, second_pfilter, delta=delta)
-        if not matches or len(matches) < min_matches:
-            return None
-
-        x, y = zip(*matches)
-        slope, _intercept, r_value, _p_value, _std_err = linregress(x, y)
-        return star_id, float(slope), float(r_value), len(matches)
-
-    def band_correlation(
-        self,
-        how_many: int,
-        *,
-        sort_index: int = 0,
-        delta: float = 3600 * 1.5,
-        min_matches: int = 10,
-        ndecimals: int = 8,
-    ) -> str:
-        """
-        ASCII table with the most correlated stars across filter pairs.
-
-        The table includes, for each pair of filters, the correlation coefficient
-        and the number of matched points used. Stars are selected by taking the
-        top-`how_many` using the `sort_index`-th filter-pair as the primary key.
-        """
-        pf_pairs = list(itertools.combinations(self.pfilters, 2))
-        if not pf_pairs:
-            raise NoStarsSelectedError("database has fewer than two photometric filters")
-
-        if not (0 <= sort_index < len(pf_pairs)):
-            raise ValueError(f"sort_index out of range (0..{len(pf_pairs)-1})")
-
-        main_pair = pf_pairs[sort_index]
-        main_corr: List[Tuple[int, float, int]] = []  # (id, r, n)
-
-        for sid in self.star_ids:
-            res = self.star_correlation(sid, *main_pair, min_matches=min_matches, delta=delta)
-            if res:
-                _sid, _slope, r, n = res
-                main_corr.append((sid, r, n))
-
-        if not main_corr:
-            a, b = main_pair
-            raise NoStarsSelectedError(
-                f"no stars with at least {min_matches} matched points in {a}-{b}"
-            )
-
-        main_corr.sort(key=operator.itemgetter(1), reverse=True)
-        top = main_corr[:how_many]
-        top_ids = [sid for sid, _r, _n in top]
-
-        # correlations[ pair ][ star_id ] = (r_value or None, n_matches or None)
-        correlations: Dict[Tuple[Any, Any], Dict[int, Tuple[Optional[float], Optional[int]]]] = \
-            collections.defaultdict(dict)
-
-        for sid, r, n in top:
-            correlations[main_pair][sid] = (float(r), int(n))
-
-        # Compute correlations for other pairs only for selected stars
-        for idx, pair in enumerate(pf_pairs):
-            if idx == sort_index:
-                continue
-            for sid in top_ids:
-                res = self.star_correlation(sid, *pair, min_matches=min_matches, delta=delta)
-                if res:
-                    _sid, _slope, r, n = res
-                    correlations[pair][sid] = (float(r), int(n))
-                else:
-                    correlations[pair][sid] = (None, None)
-
-        # Build table
-        header: List[str] = ["Star"]
-        for a, b in pf_pairs:
-            tag = f"{a.letter}-{b.letter}"
-            header.append(f"r-value {tag}")
-            header.append("Matches")
-
-        rows: List[List[Optional[float]]] = []
-        for sid in top_ids:
-            row: List[Optional[float]] = [sid]
-            for pair in pf_pairs:
-                r, n = correlations[pair][sid]
-                row.append(r)
-                row.append(n)
-            rows.append(row)
-
-        return self._ascii_table(header, rows, sort_index=None, descending=True, ndecimals=ndecimals)
-
-    @staticmethod
-    def dump(path: str | Path, data: Iterable[Iterable[float]], *, decimals: int = 8) -> None:
-        """
-        Dump rows of floats to a tab-separated text file (overwrites if exists).
-        """
-        p = Path(path)
-        with p.open("w", encoding="utf-8") as fd:
-            for row in data:
-                fd.write("\t".join(f"{val:.{decimals}f}" for val in row) + "\n")
-
-    def sort_by_curve_stdev(
-        self,
-        pfilter,
-        *,
-        minimum: int = 10,
-    ) -> List[Tuple[int, float]]:
-        """
-        Sort stars by the standard deviation of their light curves in `pfilter`.
-
-        Returns
-        -------
-        list[(star_id, stdev)] sorted ascending by stdev.
-        """
-        out: List[Tuple[int, float]] = []
-        for sid in self.star_ids:
-            curve = self.get_light_curve(sid, pfilter)
-            if curve is None or len(curve) < minimum:
-                continue
-            out.append((sid, float(curve.stdev)))
-
-        if not out:
-            raise NoStarsSelectedError(f"no light curves with at least {minimum} points in {pfilter}")
-
-        return sorted(out, key=operator.itemgetter(1))
-
-    def curve_stdev(
-        self,
-        how_many: int,
-        *,
-        sort_index: int = 0,
-        minimum: int = 10,
-        ndecimals: int = 8,
-    ) -> str:
-        """
-        Return an ASCII table with the `how_many` most constant stars.
-
-        Stars are selected by smallest stdev in the `sort_index`-th filter
-        (filters are ordered by effective wavelength). Rows include the stdev
-        across all filters for those stars (or empty if no curve/too few points).
-        """
-        main_pf = self.pfilters[sort_index]
-        best = self.sort_by_curve_stdev(main_pf, minimum=minimum)[:how_many]
-        top_ids = [sid for sid, _stdev in best]
-
-        stdevs: Dict[Any, Dict[int, Optional[float]]] = collections.defaultdict(dict)
-        for sid, stdev in best:
-            stdevs[main_pf][sid] = stdev
-
-        for idx, pf in enumerate(self.pfilters):
-            if idx == sort_index:
-                continue
-            for sid in top_ids:
-                curve = self.get_light_curve(sid, pf)
-                if curve is None or len(curve) < minimum:
-                    stdevs[pf][sid] = None
-                else:
-                    stdevs[pf][sid] = float(curve.stdev)
-
-        header = ["Star"] + [f"{pf} Stdev" for pf in self.pfilters]
-        rows: List[List[Optional[float]]] = []
-        for sid in top_ids:
-            row: List[Optional[float]] = [sid]
-            for pf in self.pfilters:
-                row.append(stdevs[pf].get(sid))
-            rows.append(row)
-
-        # +1 because first displayed column is the index we add, then 'Star'
-        return self._ascii_table(
-            header,
-            rows,
-            sort_index=sort_index + 1,
-            descending=False,
-            ndecimals=ndecimals,
-        )
-
-    def amplitudes_by_wavelength(
-        self,
-        increasing: bool,
-        npoints: int,
-        use_median: bool,
-        exclude_noisy: bool,
-        noisy_nstdevs: int,
-        noisy_use_median: bool,
-        noisy_min_ratio: float,
-    ) -> Iterator[Optional[Tuple[int, List[Tuple[Any, float, Optional[float]]]]]]:
-        """
-        Iterate over stars whose peak-to-peak amplitudes are monotonic with wavelength.
-
-        Yields
-        ------
-        - `(star_id, [(Passband, amplitude, cmp_stdev_or_None), ...])` for stars
-          that pass the criteria, otherwise `None` (useful for progress tracking).
-
-        Notes
-        -----
-        - Amplitude is defined as (median/mean of the `npoints` highest magnitudes)
-          minus (median/mean of the `npoints` lowest magnitudes) depending on
-          `use_median`.
-        - If `exclude_noisy` is True, amplitudes must exceed
-          `noisy_min_ratio * S`, where `S` is the median/mean (depending on
-          `noisy_use_median`) stdev of `noisy_nstdevs` stars with most similar
-          magnitude that *do* have a light curve in that filter.
-        """
-        pfilters = sorted(self.pfilters, reverse=not increasing)
-        amp_kwargs = dict(npoints=npoints, median=use_median)
-
-        for sid in self.star_ids:
-            discarded = False
-            amps: List[float] = []
-            cmp_stdevs: List[Optional[float]] = []
-
-            for pf in pfilters:
-                curve = self.get_light_curve(sid, pf)
-                if not curve:
-                    discarded = True
-                    break
-
-                amp = float(curve.amplitude(**amp_kwargs))
-                amps.append(amp)
-
-                if exclude_noisy:
-                    # IDs of `noisy_nstdevs` most similar-magnitude stars (with curves)
-                    similar_ids: List[int] = []
-                    g = self.most_similar_magnitude(sid, pf)  # generator of (id, diff, ...)
-                    try:
-                        for _ in range(noisy_nstdevs):
-                            similar_ids.append(next(g)[0])  # type: ignore[index]
-                    except StopIteration:
-                        pass
-
-                    if len(similar_ids) != noisy_nstdevs:
-                        discarded = True
-                        break
-
-                    stdevs = [self.get_light_curve(i, pf).stdev for i in similar_ids]
-                    agg = np.median if noisy_use_median else np.mean
-                    s_ref = float(agg(stdevs))
-                    cmp_stdevs.append(s_ref)
-                    if s_ref == 0 or (amp / s_ref) < noisy_min_ratio:
-                        discarded = True
-                        break
-                else:
-                    cmp_stdevs.append(None)
-
-            if not discarded and amps == sorted(amps):
-                yield sid, list(zip(pfilters, amps, cmp_stdevs))
-            else:
-                yield None
+    def refresh(self) -> None:
+        """Recompute pfilters and star_ids (e.g., after DB updates)."""
+        self._ensure_photometry_compat()
+        self._has_photometry = self._table_has_rows("photometry")
+        self._has_light_curves = self._table_has_rows("light_curves")
+        self._build_index()
 
 
-# Default logger config (only if the root hasn't been configured)
+# Default logger config (only if root isn't configured)
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)

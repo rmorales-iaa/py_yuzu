@@ -16,7 +16,7 @@ from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore
 
 from .light_curve_view import LightCurveView
 from .star_info_panel import StarInfoPanel
-from .reference_stars_table import ReferenceStarsTable
+from .comparison_stars_table import ReferenceStarsTable
 from .curve_points_table import CurvePointsTable
 
 # Optional legacy frame fallback (we keep a compat list panel)
@@ -614,7 +614,7 @@ class StarDetailsWindow(Gtk.Window):
 
         # Bottom panels: reference table + data points table
         try:
-            refs_panel = ReferenceStarsTable("Reference stars")
+            refs_panel = ReferenceStarsTable("Comparison stars")
         except Exception:
             refs_panel = None
         try:
@@ -629,7 +629,7 @@ class StarDetailsWindow(Gtk.Window):
                 return panel
             return _CompatStringListPanel(title)
 
-        self.refs   = _ensure_panel(refs_panel,   "Reference stars")
+        self.refs   = _ensure_panel(refs_panel,   "Comparison stars")
         self.points = _ensure_panel(points_panel, "Data points")
 
         self.bottom_paned.set_start_child(self.refs)
@@ -707,7 +707,7 @@ class StarDetailsWindow(Gtk.Window):
             if hasattr(self.refs, "clear"):
                 try: self.refs.clear(); return
                 except Exception: pass
-            self._panel_set_lines(self.refs, "Reference stars", [], side="start")
+            self._panel_set_lines(self.refs, "Comparison stars", [], side="start")
             return
         if hasattr(self.refs, "set_rows"):
             try: self.refs.set_rows(rows); return
@@ -718,7 +718,7 @@ class StarDetailsWindow(Gtk.Window):
             wtxt = "—" if wt is None else f"{wt:.4f}"
             stxt = "—" if st is None else f"{st:.4f}"
             lines.append(f"{sidr:5d}    w={wtxt:>8}    σ={stxt:>8}")
-        self._panel_set_lines(self.refs, "Reference stars", lines, side="start")
+        self._panel_set_lines(self.refs, "Comparison stars", lines, side="start")
 
     def _panel_set_cpoints_rows(self, rows: List[Tuple[int, float, float, Optional[float]]]) -> None:
         self._export_rows_pts = rows[:]  # keep for export

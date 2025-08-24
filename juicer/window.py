@@ -198,7 +198,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         hb = Gtk.HeaderBar.new()
         self.set_titlebar(hb)
         open_btn = Gtk.Button.new_from_icon_name("document-open-symbolic")
-        open_btn.set_tooltip_text("Open LEMON database…")
+        open_btn.set_tooltip_text("Open LEMON database?")
         open_btn.connect("clicked", self._on_open_clicked)
         hb.pack_start(open_btn)
 
@@ -444,8 +444,10 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # Close previous
         try:
             if self._star_win is not None:
-                try: self._star_win.destroy()
-                except Exception: pass
+                try:
+                    self._star_win.destroy()
+                except Exception:
+                    pass
                 self._star_win = None
         except Exception:
             self._star_win = None
@@ -453,9 +455,30 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         try:
             # Build payload directly from this row (dict expected by StarDetailsWindow)
             sid = int(getattr(row.props, "id", -1))
-            ra  = float(getattr(row.props, "ra", 0.0))
+            ra = float(getattr(row.props, "ra", 0.0))
             dec = float(getattr(row.props, "dec", 0.0))
             imag = getattr(row.props, "imag", float("nan"))
+
+            # Choose a default filter for this star (the one with the most points)
+            default_filt = None
+            default_n = -1
+            try:
+                for pf in (getattr(self._miner, "pfilters", []) or []):
+                    try:
+                        curve = self._miner.get_light_curve(sid, pf)
+                    except Exception:
+                        curve = None
+                    n = len(curve) if curve else 0
+                    if n > default_n:
+                        default_n = n
+                        # Prefer a human-friendly name; fall back to id
+                        default_filt = getattr(pf, "name", None)
+                        if default_filt is None:
+                            default_filt = getattr(pf, "letter", None)
+                        if default_filt is None:
+                            default_filt = getattr(pf, "id", None)
+            except Exception:
+                pass
 
             data = {
                 "id": sid,
@@ -464,9 +487,10 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 "ra_str": _hms_from_deg(ra),
                 "dec_str": _dms_from_deg(dec),
                 "mag": None if (imag is None or (isinstance(imag, float) and math.isnan(imag))) else float(imag),
-                "filt": None,
-                "n_points": None,
-                "field_name": getattr(self._miner, "field_name", "") or (Path(self._db_path).stem if self._db_path else ""),
+                "filt": default_filt,
+                "n_points": (None if default_n < 0 else default_n),
+                "field_name": getattr(self._miner, "field_name", "") or (
+                    Path(self._db_path).stem if self._db_path else ""),
                 "simbad_id": None,
             }
 
@@ -520,11 +544,11 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"LEMON juicer — {Path(db_path).name}")
+        self.set_title(f"LEMON juicer ? {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
         self._populate_overview_from_miner(miner)
 
-        # If CLI passed --star …, ensure autoselect + AUTO-OPEN happens
+        # If CLI passed --star ?, ensure autoselect + AUTO-OPEN happens
         self._ensure_autoselect_when_ready()
 
     # -------- Auto-select / reveal --------
@@ -610,51 +634,57 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         return False
 
     def _reveal_sorted_position(self, pos: int) -> None:
+        """
+        Safely reveal (scroll to) a row at `pos` in the *sorted* model.
+        Guards against empty models and out-of-range indices to avoid
+        gtk_column_view_scroll_to assertions.
+        """
         try:
-            self._view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, None)  # type: ignore[attr-defined]
-            try: self._view.grab_focus()
-            except Exception: pass
-            return
-        except Exception:
-            pass
-        try:
-            self._view.activate_action("list.scroll-to-item", GLib.Variant('u', pos))
-            try: self._view.grab_focus()
-            except Exception: pass
-            return
-        except Exception:
-            pass
-        try:
-            lv = self._find_inner_listview()
-            if lv is not None:
-                lv.activate_action("list.scroll-to-item", GLib.Variant('u', pos))
-                try: self._view.grab_focus()
-                except Exception: pass
+            sort_model = getattr(self, "_sort_model", None)
+            view = getattr(self, "_view", None)
+            sel = getattr(self, "_sel", None)
+            if sort_model is None or view is None or sel is None:
                 return
-        except Exception:
-            pass
-        try:
-            w = self._row_widgets.get(pos)
-            if w is not None and self._scroll_to_widget_bounds(w):
+
+            # Normalize/validate index
+            try:
+                pos = int(pos)
+            except Exception:
                 return
+            try:
+                n_items = int(sort_model.get_n_items())
+            except Exception:
+                # Fallback if ListModel-like API is missing
+                try:
+                    n_items = int(view.get_model().get_n_items())  # type: ignore[attr-defined]
+                except Exception:
+                    n_items = 0
+            if n_items <= 0 or pos < 0 or pos >= n_items:
+                return
+
+            # Select the row (if we have a selection model)
+            try:
+                sel.set_selected(pos)  # Gtk.SingleSelection
+            except Exception:
+                pass
+
+            # Scroll to the row in the ColumnView
+            try:
+                from gi.repository import Gtk  # type: ignore
+                view.scroll_to(pos, None, Gtk.ListScrollFlags.SELECT, None)
+            except Exception:
+                # Fallback: best-effort focus without scrolling
+                pass
+
+            # Try to focus the list so keyboard nav works
+            try:
+                view.grab_focus()
+            except Exception:
+                pass
+
         except Exception:
-            pass
-        try:
-            if self._scroller:
-                vadj = self._scroller.get_vadjustment()
-                if vadj:
-                    row_h = self._row_height_px or 30
-                    page = vadj.get_page_size()
-                    upper = vadj.get_upper()
-                    if row_h > 0 and page > 0 and upper > 0:
-                        target_y = max(0.0, pos * float(row_h) - 0.3 * page)
-                        target_y = min(target_y, max(0.0, upper - page))
-                        if abs(vadj.get_value() - target_y) > 1.0:
-                            vadj.set_value(target_y)
-                        try: self._view.grab_focus()
-                        except Exception: pass
-        except Exception:
-            pass
+            # Final guard: never let UI crash here
+            return
 
     def _select_nearest_to(self, ra_deg: float, dec_deg: float) -> None:
         best_i = -1; best_sep = float("inf"); best_id = None
@@ -902,29 +932,85 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
     # -------- Populate UI --------
     def _populate_overview_from_miner(self, miner) -> None:
+        # Reset model safely
         try:
             self._rows.remove_all()
         except Exception:
+            from gi.repository import Gio  # type: ignore
             self._rows = Gio.ListStore.new(StarRow)
             self._sort_model.set_model(self._rows)
             self._sel.set_model(self._sort_model)
             self._view.set_model(self._sel)
 
-        self._row_widgets.clear()
+        # Clear per-row widget cache (used for reveal/scroll helpers)
+        try:
+            self._row_widgets.clear()
+        except Exception:
+            self._row_widgets = {}
 
         n_added = 0
-        for star_id in getattr(miner, "star_ids", []):
+        star_ids = list(getattr(miner, "star_ids", []) or [])
+
+        for star_id in star_ids:
             try:
-                x, y, ra, dec, *_rest, imag = miner.get_star(star_id)
-                row = StarRow(id=int(star_id), ra=float(ra), dec=float(dec), imag=float(imag))
+                s = miner.get_star(star_id)
+
+                # Extract ra/dec/imag from various shapes
+                ra = dec = imag = None
+
+                if isinstance(s, (tuple, list)):
+                    # Common miner shapes:
+                    # (x, y, ra, dec, ..., imag)  -> ra=s[2], dec=s[3], imag=s[-1]
+                    if len(s) >= 5:
+                        ra, dec, imag = s[2], s[3], s[-1]
+                    # Fallbacks (be tolerant but safe)
+                    elif len(s) >= 3:
+                        ra, dec = s[0], s[1]
+                        imag = s[2]
+                    else:
+                        raise ValueError(f"Unexpected star tuple length: {len(s)}")
+
+                elif isinstance(s, dict):
+                    ra = s.get("ra")
+                    dec = s.get("dec")
+                    imag = s.get("imag", s.get("mag"))
+
+                else:
+                    # Likely an ORM row / object with attributes
+                    ra = getattr(s, "ra")
+                    dec = getattr(s, "dec")
+                    imag = getattr(s, "imag", getattr(s, "mag", None))
+
+                if ra is None or dec is None:
+                    raise ValueError("Missing RA/Dec")
+
+                row = StarRow(
+                    id=int(star_id),
+                    ra=float(ra),
+                    dec=float(dec),
+                    imag=(float(imag) if imag is not None else float("nan")),
+                )
                 self._rows.append(row)
                 n_added += 1
-            except Exception:
+
+            except Exception as e:
+                try:
+                    logger.debug("Skipping star %s: %s", star_id, e)
+                except Exception:
+                    pass
                 continue
 
-        n_filters = len(getattr(miner, "pfilters", []))
-        field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
-        self._set_status(f"Field: {field} — Stars shown: {n_added} — Filters: {n_filters}")
+        # Status line: field name, counts, filters
+        try:
+            field = getattr(miner, "field_name", "") or Path(getattr(miner, "path", "")).name
+        except Exception:
+            field = ""
+        try:
+            n_filters = len(getattr(miner, "pfilters", []) or [])
+        except Exception:
+            n_filters = 0
+
+        self._set_status(f"Field: {field} ? Stars shown: {n_added} ? Filters: {n_filters}")
 
     # -------- Autoselect & auto-open --------
     def _ensure_autoselect_when_ready(self) -> None:

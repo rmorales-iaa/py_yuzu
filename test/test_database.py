@@ -2175,7 +2175,7 @@ class LEMONdBTest(unittest.TestCase):
             # Star 3: abs(10.3 - 10.1) = 0.2 --> 1st
             # Star 4: abs(10.3 - 13.4) = 3.1 --> 4th
             #
-            # Note that the method can be called even it the reference star (i.e.,
+            # Note that the method can be called even it the comparison star (i.e.,
             # the star to which the instrumental magnitudes of all the stars are
             # compared) does not have a light curve in this filter.
 

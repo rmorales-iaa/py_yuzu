@@ -1,4 +1,4 @@
-# juicer/app.py — GTK4 application entrypoint using external .ui files
+# juicer/app.py ? GTK4 application entrypoint using external .ui files
 # - Loads UI from /mnt/uxmal_groups/common_data/apps/py_yuzu/juicer/gui/main.ui (or $LEMON_GLADE_DIR)
 # - Hooks ConfigManager (if available) for theme + window geometry
 # - Optionally persists ColumnView column widths

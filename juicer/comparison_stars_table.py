@@ -1,4 +1,4 @@
-# juicer/reference_stars_table.py
+# juicer/comparison_stars_table.py
 from __future__ import annotations
 from typing import Iterable, Optional, Tuple
 
@@ -122,7 +122,7 @@ class ReferenceStarsTable(Gtk.Box):
         set_rows(rows)  # rows: Iterable[(id, weight|None, sigma|None)]
     """
 
-    def __init__(self, title: str = "Reference stars") -> None:
+    def __init__(self, title: str = "Comparison stars") -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         _install_css()
         self.add_css_class("lemon-surface")
