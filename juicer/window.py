@@ -127,7 +127,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # Geometry from config
         width  = _cfg_get_int("main_window", "width", 1200)
         height = _cfg_get_int("main_window", "height", 800)
-        super().__init__(application=app, title=f"LEMON Juicer{title_suffix}")
+        super().__init__(application=app, title=f"yuzu juicer{title_suffix}")
         self.set_default_size(width, height)
 
         # One-shot autoselection (degrees)
@@ -382,7 +382,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         status_bar.add_css_class("lemon-statusbar")
         status_bar.set_hexpand(True)
-        self._status = Gtk.Label(label="Open a .LEMONdB to begin.")
+        self._status = Gtk.Label(label="Open a .db to begin.")
         self._status.set_halign(Gtk.Align.START)
         self._status.set_selectable(True)
         self._install_status_context_menu()
@@ -508,8 +508,8 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
     def _show_open_dialog(self) -> None:
         dlg = Gtk.FileDialog.new()
         filt = Gtk.FileFilter()
-        filt.set_name("LEMON Database (*.LEMONdB)")
-        filt.add_pattern("*.LEMONdB")
+        filt.set_name("LEMON Database (*.db)")
+        filt.add_pattern("*.db")
         dlg.set_default_filter(filt)
 
         def _on_done(_src, res):
@@ -532,9 +532,9 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
             if not p or not p.exists():
                 raise FileNotFoundError(f"Path does not exist:\n{path}")
             if not p.is_file():
-                raise IsADirectoryError(f"Expected a .LEMONdB file, got a directory:\n{path}")
-            if p.suffix.lower() != ".lemondb":
-                raise ValueError(f"Not a LEMON database (*.LEMONdB):\n{path}")
+                raise IsADirectoryError(f"Expected a .db file, got a directory:\n{path}")
+            if p.suffix.lower() != ".db":
+                raise ValueError(f"Not a LEMON database (*.db):\n{path}")
             self._load_db(str(p))
         except Exception as e:
             self._show_error(f"Failed to open database:\n{p}\n\n{e}")

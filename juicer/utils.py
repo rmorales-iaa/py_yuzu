@@ -7,6 +7,8 @@ from typing import Optional, Iterable, Type
 
 # Directory helpers for optional by-path import of mining.py
 PKG_DIR = Path(__file__).resolve().parent
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_PREFERRED_SUFFIXES = {".lemondb", ".db", ".sqlite", ".sqlite3", ".db3"}
 
 def _import_miner_class() -> Type:
     """
@@ -44,16 +46,41 @@ def _import_miner_class() -> Type:
 
 def _pick_lemondb_from_args(cli_hint: Optional[str],
                             argv: Optional[Iterable[str]]) -> Optional[str]:
-    """Return first existing *.LEMONdB file from cli_hint or argv."""
-    cand: list[str] = []
-    if cli_hint:
-        cand.append(cli_hint)
-    cand.extend(map(str, (argv or [])))
-    for c in cand:
+    """
+    Return the first existing database path from cli_hint or argv.
+    Accepts .LEMONdB, .db, .sqlite*, or any file that looks like SQLite.
+    """
+    def _is_sqlite_file(p: Path) -> bool:
         try:
-            p = Path(c).expanduser()
+            with p.open("rb") as f:
+                return f.read(16) == _SQLITE_MAGIC
+        except Exception:
+            return False
+
+    # 1) Explicit hint wins if it exists (any suffix)
+    if cli_hint:
+        p = Path(cli_hint).expanduser()
+        if p.is_file():
+            return str(p)
+
+    # 2) Scan argv for existing files
+    files: list[Path] = []
+    for tok in (argv or []):
+        try:
+            p = Path(str(tok)).expanduser()
         except Exception:
             continue
-        if p.is_file() and p.suffix.lower() == ".lemondb":
+        if p.is_file():
+            files.append(p)
+
+    # 3) Prefer known suffixes
+    for p in files:
+        if p.suffix.lower() in _PREFERRED_SUFFIXES:
             return str(p)
+
+    # 4) As a fallback, detect SQLite by magic header
+    for p in files:
+        if _is_sqlite_file(p):
+            return str(p)
+
     return None
