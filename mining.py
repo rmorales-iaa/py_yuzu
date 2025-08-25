@@ -77,16 +77,18 @@ class LEMONdBMiner:
     Methods the GTK UI calls:
       • ``get_star(star_id)`` → mapping with at least ra, dec, imag
       • ``get_light_curve(star_id, pfilter=None)`` → list[(t, mag, snr)]
+      • ``get_cmp_stars(star_id, pfilter=None)`` → list[(cstar_id, weight, stdev)]
+      • ``get_cmp_stars_info(star_id, pfilter=None)`` → list[dict]
 
-    It also guarantees a *materialized* ``photometry`` table exists if the DB only
-    has ``light_curves``; a legacy ``photometry`` VIEW is dropped and replaced by a
-    real table to keep downstream code consistent.
+    To maximize compatibility with older juicer panels, several **alias** names
+    are supported via ``__getattr__`` (e.g. ``get_comparison_stars``,
+    ``comparison_stars_info``). These forward to the canonical methods above.
     """
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-    def __init__(self, db_path: Union[str, Path]) -> None:
+    def __init__(self, db_path: Union[str, Path]) -> None:(self, db_path: Union[str, Path]) -> None:
         p = Path(db_path)
         if not p.is_file():
             raise FileNotFoundError(str(p))
@@ -232,6 +234,7 @@ class LEMONdBMiner:
             return [PFilter(int(r[0])) for r in cur.fetchall()]
 
     def _time_expr(self) -> Tuple[str, str]:
+(self) -> Tuple[str, str]:
         cols = set(_columns(self._conn, "images")) if self._has_images else set()
         if "unix_time" in cols:
             return ("i.unix_time", "t")
@@ -326,7 +329,8 @@ class LEMONdBMiner:
                 params.append(int(flt_id))
 
         sql.append("ORDER BY i.unix_time ASC, i.id ASC")
-        q = "\n".join(sql)
+        q = "
+".join(sql)
 
         rows = self._conn.execute(q, params).fetchall()
         out: List[Tuple[float, float, Optional[float]]] = []
@@ -340,6 +344,130 @@ class LEMONdBMiner:
                 # Be permissive; skip malformed rows
                 continue
         return out
+    # ------------------------------------------------------------------
+    # Comparison stars API
+    # ------------------------------------------------------------------
+    def _dominant_filter_id_for_star(self, star_id: int) -> Optional[int]:
+        """Pick the filter with the most points for the given star."""
+        if not self._has_images or not (_table_exists(self._conn, self._meas_table) or _view_exists(self._conn, self._meas_table)):
+            return None
+        # Prefer images.filter_id counts
+        if "filter_id" in _columns(self._conn, "images"):
+            q = (
+                "SELECT i.filter_id, COUNT(*) AS n "
+                f"FROM {self._meas_table} m JOIN images i ON i.id = m.image_id "
+                "WHERE m.star_id = ? AND i.filter_id IS NOT NULL "
+                "GROUP BY i.filter_id ORDER BY n DESC LIMIT 1"
+            )
+            row = self._conn.execute(q, (int(star_id),)).fetchone()
+            return None if row is None else int(row[0])
+        # Fallback: if measurement table carries filter_id itself
+        if "filter_id" in _columns(self._conn, self._meas_table):
+            q = (
+                f"SELECT m.filter_id, COUNT(*) AS n FROM {self._meas_table} m "
+                "WHERE m.star_id = ? AND m.filter_id IS NOT NULL "
+                "GROUP BY m.filter_id ORDER BY n DESC LIMIT 1"
+            )
+            row = self._conn.execute(q, (int(star_id),)).fetchone()
+            return None if row is None else int(row[0])
+        return None
+
+    def _resolve_filter_id(self, pfilter: Any, star_id: int) -> Optional[int]:
+        """Resolve various filter spec forms into a filter_id integer.
+        If pfilter is None, choose the star's dominant filter.
+        """
+        if pfilter is None:
+            return self._dominant_filter_id_for_star(star_id)
+        if isinstance(pfilter, PFilter):
+            return int(pfilter.id)
+        if isinstance(pfilter, int):
+            return int(pfilter)
+        if isinstance(pfilter, str):
+            key = pfilter.strip().lower()
+            # try exact id
+            try:
+                return int(key)
+            except Exception:
+                pass
+            for pf in self._pfilters:
+                if key in {(pf.name or "").lower(), (pf.letter or "").lower()}:
+                    return int(pf.id)
+        return None
+
+    def get_cmp_stars(self, star_id: int, pfilter: Any | None = None) -> List[Tuple[int, float, float]]:
+        """Return comparison stars for the given target and filter.
+
+        Output: list of tuples ``(cstar_id, weight, stdev)`` sorted by weight desc.
+        If ``pfilter`` is None, the dominant filter for ``star_id`` is used.
+        If no ``cmp_stars`` table is present, returns an empty list.
+        """
+        if not _table_exists(self._conn, "cmp_stars"):
+            return []
+        fid = self._resolve_filter_id(pfilter, star_id)
+        if fid is None:
+            return []
+        rows = self._conn.execute(
+            """
+            SELECT cstar_id, weight, stdev
+            FROM cmp_stars
+            WHERE star_id = ? AND filter_id = ?
+            ORDER BY weight DESC, stdev ASC
+            """,
+            (int(star_id), int(fid)),
+        ).fetchall()
+        out: List[Tuple[int, float, float]] = []
+        for r in rows:
+            try:
+                out.append((int(r[0]), float(r[1]), float(r[2])))
+            except Exception:
+                continue
+        return out
+
+    # Public helpers for UI integration
+    def filter_id_from_label(self, label: Any, *, star_id: Optional[int] = None) -> Optional[int]:
+        """Resolve a UI label (id/name/letter) to a filter id. If ``star_id`` is
+        provided and ``label`` is None, picks the star's dominant filter.
+        """
+        return self._resolve_filter_id(label, star_id or -1)
+
+    def get_cmp_stars_info(self, star_id: int, pfilter: Any | None = None) -> List[dict]:
+        """Rich comparison-star rows for UI tables.
+        Returns dicts with keys: ``cstar_id, weight, stdev, ra, dec, imag``.
+        """
+        if not _table_exists(self._conn, "cmp_stars"):
+            return []
+        fid = self._resolve_filter_id(pfilter, star_id)
+        if fid is None:
+            return []
+        q = (
+            """
+            SELECT cs.cstar_id   AS cstar_id,
+                   cs.weight     AS weight,
+                   cs.stdev      AS stdev,
+                   s.ra          AS ra,
+                   s.dec         AS dec,
+                   s.imag        AS imag
+            FROM cmp_stars cs
+            JOIN stars s ON s.id = cs.cstar_id
+            WHERE cs.star_id = ? AND cs.filter_id = ?
+            ORDER BY cs.weight DESC, cs.stdev ASC
+            """
+        )
+        rows = self._conn.execute(q, (int(star_id), int(fid))).fetchall()
+        out: List[dict] = []
+        for r in rows:
+            try:
+                out.append({
+                    "cstar_id": int(r["cstar_id"]),
+                    "weight": float(r["weight"]),
+                    "stdev": float(r["stdev"]),
+                    "ra": float(r["ra"]),
+                    "dec": float(r["dec"]),
+                    "imag": None if r["imag"] is None else float(r["imag"]),
+                })
+            except Exception:
+                continue
+        return out
 
     # Back-compat convenience used elsewhere sometimes
     def filters(self) -> Sequence[PFilter]:
@@ -350,3 +478,30 @@ class LEMONdBMiner:
             self._conn.close()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Compatibility shims for legacy UI method names
+    # ------------------------------------------------------------------
+    def __getattr__(self, name: str):  # pragma: no cover — dynamic compat
+        # Map a variety of historical names used by different juicer panels
+        # to the canonical comparison-star methods implemented above.
+        aliases_info = {
+            "get_comparison_stars_info": self.get_cmp_stars_info,
+            "comparison_stars_info": self.get_cmp_stars_info,
+            "cmp_stars_info": self.get_cmp_stars_info,
+            "get_cmpstars_info": self.get_cmp_stars_info,
+            "get_cmp_stars_table": self.get_cmp_stars_info,
+            "get_cmp_stars_table_rows": self.get_cmp_stars_info,
+        }
+        aliases_raw = {
+            "get_comparison_stars": self.get_cmp_stars,
+            "comparison_stars": self.get_cmp_stars,
+            "cmp_stars": self.get_cmp_stars,
+            "get_cmpstars": self.get_cmp_stars,
+            "comparison_set": self.get_cmp_stars,
+        }
+        if name in aliases_info:
+            return aliases_info[name]
+        if name in aliases_raw:
+            return aliases_raw[name]
+        raise AttributeError(name)
