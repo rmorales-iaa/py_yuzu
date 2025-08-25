@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 from typing import Optional, Iterable, Type
 
-# Directory helpers for optional by-path import of mining.py
+# Directory helpers for optional by-path import of miner.py
 PKG_DIR = Path(__file__).resolve().parent
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _PREFERRED_SUFFIXES = {".lemondb", ".db", ".sqlite", ".sqlite3", ".db3"}
@@ -17,17 +17,17 @@ def _import_miner_class() -> Type:
     """
     last_exc: Exception | None = None
     try:
-        from .mining import LEMONdBMiner  # type: ignore
+        from .miner import LEMONdBMiner  # type: ignore
         return LEMONdBMiner
     except Exception as e1:
         last_exc = e1
     try:
-        from mining import LEMONdBMiner  # type: ignore
+        from juicer.miner import LEMONdBMiner  # type: ignore
         return LEMONdBMiner
     except Exception as e2:
         last_exc = e2
 
-    candidate = PKG_DIR / "mining.py"
+    candidate = PKG_DIR / "miner.py"
     if candidate.exists():
         spec = importlib.util.spec_from_file_location("juicer.mining", candidate)
         if spec and spec.loader:
@@ -37,10 +37,10 @@ def _import_miner_class() -> Type:
             spec.loader.exec_module(mod)  # type: ignore[attr-defined]
             if hasattr(mod, "LEMONdBMiner"):
                 return getattr(mod, "LEMONdBMiner")
-            last_exc = RuntimeError("mining.py loaded but LEMONdBMiner not found")
+            last_exc = RuntimeError("miner.py loaded but LEMONdBMiner not found")
 
     raise RuntimeError(
-        "mining module not available. Ensure juicer/mining.py exists and is importable.\n"
+        "mining module not available. Ensure juicer/miner.py exists and is importable.\n"
         f"Last import error: {last_exc}"
     )
 

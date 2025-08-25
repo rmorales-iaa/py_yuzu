@@ -6,7 +6,6 @@ import collections
 import logging
 import numpy
 import operator
-import argparse as optparse  # kept name for legacy compatibility in your code
 import os
 import style
 import sys
@@ -76,7 +75,7 @@ import diffphot
 import fitsimage
 import keywords
 import json_parse
-import mining
+from juicer import miner
 import photometry
 import util
 

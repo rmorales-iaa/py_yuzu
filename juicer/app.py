@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional, Iterable, Tuple, Callable, List
 
 import gi
+
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gdk", "4.0")

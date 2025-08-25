@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-diffphot.py — LEMON differential photometry (SQLAlchemy Core, thread-safe I/O)
+diffphot.py ? LEMON differential photometry (SQLAlchemy Core, thread-safe I/O)
 
 - Reads raw photometry from INPUT_DB (SQLAlchemy Core engine)
 - For each filter:
-    · ranks stars by scatter (robust or std)
-    · picks a pool of low-scatter comparison stars
-    · builds differential light curves (target − weighted mean of comps at same time)
+    · builds comparison-star sets **per target** using residual scatter
+      (leave-one-out ensemble, iterative worst-fraction pruning)
+    · builds differential light curves:
+        target mag - weighted mean of comparisons at the same time
 - Writes to OUTPUT_DB (SQLAlchemy Core):
     · ensures schema exists
     · copies stars & images
@@ -73,13 +74,19 @@ parser.add_argument("--filter", action="append", dest="filters", default=None,
 parser.add_argument("--min-snr", type=float, default=1.0,
                     help="ignore photometric points with SNR below this threshold")
 parser.add_argument("--max-cmp", type=int, default=20,
-                    help="maximum number of comparison stars per target")
+                    help="maximum number of comparison stars per target after pruning")
 parser.add_argument("--min-cmp", type=int, default=5,
                     help="minimum number of valid comparison stars required per target time")
 parser.add_argument("--robust", action="store_true",
-                    help="use MAD-based robust scatter to rank comparison stars (else, std)")
+                    help="use MAD-based robust scatter (else, std) when ranking residuals")
 parser.add_argument("-v", "--verbose", action="count", default=getattr(defaults, "verbosity", 0),
                     help="increase output verbosity (repeat for more)")
+
+# Internal heuristics (kept constant to avoid CLI sprawl)
+_DROP_FRAC = 0.20          # drop worst fraction each pruning iteration
+_MAX_ITER  = 5             # max pruning iters
+_MIN_OVERLAP_FRAC = 0.60   # candidate must cover this fraction of target epochs
+_MIN_POINTS_ABS   = 8      # and at least this many points
 
 # ------------------------------------------------------------------------------
 # Utilities (math)
@@ -96,7 +103,10 @@ def _plain_stdev(x: np.ndarray) -> float:
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("inf")
-    return float(np.std(x))
+    return float(np.nanstd(x))
+
+def _sigma_fn(robust: bool):
+    return _robust_stdev if robust else _plain_stdev
 
 def _weight_from_stdev(sd: float) -> float:
     if not math.isfinite(sd) or sd <= 0:
@@ -230,7 +240,7 @@ def _copy_stars_images(in_eng, out_eng):
                 ],
             )
 
-    # IMAGES (path, filter, unix_time, object, airmass, gain, ra, dec, sources)
+    # IMAGES
     with in_eng.connect() as cin:
         imgs = cin.execute(text(
             "SELECT i.path, f.name, i.unix_time, i.object, i.airmass, i.gain, "
@@ -294,12 +304,10 @@ def _collect_filter_data(in_eng, pfilter: str, min_snr: float) -> Tuple[List[flo
     for sid, t, m, snr in rows:
         if t is None or m is None or snr is None:
             continue
-        m = float(m)
-        snr = float(snr)
+        m = float(m); snr = float(snr)
         if not math.isfinite(m) or snr < float(min_snr):
             continue
-        sid_i = int(sid)
-        t_f = float(t)
+        sid_i = int(sid); t_f = float(t)
         times_set.add(t_f)
         star_to_points.setdefault(sid_i, []).append((t_f, m, snr))
 
@@ -318,70 +326,167 @@ def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> int | None:
     return None if rid is None else int(rid)
 
 # ------------------------------------------------------------------------------
-# Differential photometry core
+# LEMON-style comparison set per target (residual scatter + pruning)
 # ------------------------------------------------------------------------------
 
-def _rank_comparison_stars(star_to_points: Dict[int, List[Tuple[float, float, float]]], robust: bool):
-    fn = _robust_stdev if robust else _plain_stdev
-    ranking = []
-    for sid, pts in star_to_points.items():
-        mags = np.array([m for _, m, _ in pts], dtype=float)
-        sd = fn(mags)
-        ranking.append((sid, float(sd)))
-    ranking.sort(key=lambda x: (x[1], x[0]))
-    return ranking
+def _align_to_target_times(
+    target_times: List[float],
+    pts: List[Tuple[float, float, float]],
+) -> np.ndarray:
+    """Return vector of magnitudes aligned to target_times; NaN where missing."""
+    mp = {t: m for (t, m, _s) in pts}
+    arr = np.full((len(target_times),), np.nan, dtype=float)
+    for i, t in enumerate(target_times):
+        val = mp.get(t)
+        if val is not None and math.isfinite(val):
+            arr[i] = float(val)
+    return arr
 
-def _build_cmp_pool(ranking, max_cmp: int) -> List[int]:
-    pool = [sid for sid, sd in ranking if math.isfinite(sd)]
-    return pool[:max_cmp] if max_cmp > 0 else pool
+def _loo_ensemble_median(A: np.ndarray, j: int) -> np.ndarray:
+    """Leave-one-out median across columns (ignore NaNs). A is (T, K)."""
+    if A.shape[1] <= 1:
+        return np.full((A.shape[0],), np.nan)
+    keep = [k for k in range(A.shape[1]) if k != j]
+    return np.nanmedian(A[:, keep], axis=1)
+
+def _compute_cmp_weights_for_target(
+    target_id: int,
+    star_to_points: Dict[int, List[Tuple[float, float, float]]],
+    *,
+    robust: bool,
+    max_cmp: int,
+) -> Tuple[List[int], List[float], List[float], List[float]]:
+    """
+    Returns (cstar_ids, weights, sigmas, target_times).
+    - weights sum to 1 over the final set
+    - sigmas are final residual scatters per comp
+    - target_times is the sorted list of epochs for the target
+    """
+    t_pts = star_to_points.get(int(target_id), [])
+    if not t_pts:
+        return [], [], [], []
+
+    tgt_times = [t for (t, _m, _s) in t_pts]
+    T = len(tgt_times)
+    min_needed = max(_MIN_POINTS_ABS, int(math.ceil(_MIN_OVERLAP_FRAC * T)))
+
+    # Candidate list: all other stars with sufficient overlap on target epochs
+    candidates: List[int] = []
+    series: List[np.ndarray] = []
+    for sid, pts in star_to_points.items():
+        if sid == target_id:
+            continue
+        vec = _align_to_target_times(tgt_times, pts)
+        if np.isfinite(vec).sum() >= min_needed:
+            candidates.append(int(sid))
+            series.append(vec)
+
+    if not candidates:
+        return [], [], [], tgt_times
+
+    M = np.stack(series, axis=1)  # (T, C)
+    C = M.shape[1]
+    sig_fn = _sigma_fn(robust)
+
+    # Preliminary reduction: keep best by raw (robust/std) scatter to lighten the matrix
+    prelim = np.array([sig_fn(M[:, j]) for j in range(C)], dtype=float)
+    order = np.argsort(prelim)  # small scatter first
+    topk = min(max_cmp * 3, C) if max_cmp > 0 else C
+    cols = order[:topk]
+    M = M[:, cols]
+    candidates = [candidates[j] for j in cols]
+
+    # Iterative pruning by residual scatter using leave-one-out ensemble
+    cur = list(range(M.shape[1]))
+    for _ in range(_MAX_ITER):
+        if len(cur) <= max(3, min(5, max_cmp)):  # don't over-shrink
+            break
+        # residual sigmas
+        rsig = []
+        for j in range(len(cur)):
+            a = _loo_ensemble_median(M[:, cur], j)
+            resid = M[:, cur[j]] - a
+            rsig.append(sig_fn(resid))
+        rsig = np.asarray(rsig, dtype=float)
+        # drop worst fraction
+        keep_n = max(3, int(round((1.0 - _DROP_FRAC) * len(cur))))
+        keep_idx = np.argsort(rsig)[:keep_n]
+        new_cur = [cur[k] for k in keep_idx]
+        if len(new_cur) == len(cur):
+            break
+        cur = new_cur
+
+    # Final sigma + 1/sigma^2 weights
+    final_sig = []
+    for j in range(len(cur)):
+        a = _loo_ensemble_median(M[:, cur], j)
+        resid = M[:, cur[j]] - a
+        final_sig.append(sig_fn(resid))
+    final_sig = np.asarray(final_sig, dtype=float)
+
+    invvar = 1.0 / np.maximum(final_sig ** 2, 1e-12)
+    w = invvar / float(np.nansum(invvar)) if np.isfinite(invvar).any() else invvar
+
+    # Cap to max_cmp if still larger; renormalize
+    if max_cmp > 0 and len(cur) > max_cmp:
+        order2 = np.argsort(final_sig)[:max_cmp]  # best sigmas
+        cur = [cur[k] for k in order2]
+        w = w[order2]
+        final_sig = final_sig[order2]
+        s = float(np.sum(w))
+        if s > 0:
+            w = w / s
+
+    cstar_ids = [candidates[j] for j in cur]
+    weights = [float(x) for x in w.tolist()]
+    sigmas  = [float(x) for x in final_sig.tolist()]
+    return cstar_ids, weights, sigmas, tgt_times
+
+# ------------------------------------------------------------------------------
+# Differential photometry core (per-target)
+# ------------------------------------------------------------------------------
 
 def _build_one_curve(
     target_id: int,
     pfilter: str,
-    times: List[float],
     star_to_points: Dict[int, List[Tuple[float, float, float]]],
-    cmp_pool: List[int],
-    ranking_map: Dict[int, float],
+    *,
+    max_cmp: int,
     min_cmp: int,
+    robust: bool,
 ) -> Tuple[int, dict]:
     """Return (target_id, {'cstars','cweights','cstdevs','points'})"""
-    # Comparison pool weights from scatter
-    cstars, cweights, cstdevs = [], [], []
-    for sid in cmp_pool:
-        if sid == target_id:
-            continue
-        sd = ranking_map.get(sid, float("inf"))
-        w = _weight_from_stdev(sd)
-        if w > 0:
-            cstars.append(int(sid))
-            cweights.append(float(w))
-            cstdevs.append(float(sd))
 
-    ws = np.asarray(cweights, dtype=float)
-    ws = ws / ws.sum() if ws.sum() > 0 else ws
+    cstars, cweights, cstdevs, tgt_times = _compute_cmp_weights_for_target(
+        target_id, star_to_points, robust=robust, max_cmp=max_cmp
+    )
 
-    # Build time-indexed maps
+    if not cstars or not tgt_times:
+        return int(target_id), {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
+
+    # Maps for fast lookup
     tgt_map = {t: (m, s) for (t, m, s) in star_to_points.get(target_id, [])}
     cmp_maps = {sid: {t: (m, s) for (t, m, s) in star_to_points.get(sid, [])} for sid in cstars}
 
+    # Build points using per-target weights; re-normalize among comps present at each t
+    w_arr = np.asarray(cweights, dtype=float)
     points: List[Tuple[float, float, float]] = []
-    for t in times:
+
+    for t in tgt_times:
         tgt = tgt_map.get(t)
         if tgt is None:
             continue
         tgt_mag, tgt_snr = tgt
 
         mags, ww = [], []
-        for sid, w in zip(cstars, ws):
+        for sid, w in zip(cstars, w_arr):
             m = cmp_maps.get(sid, {}).get(t)
             if m is None:
                 continue
-            mags.append(m[0])
-            ww.append(float(w))
+            mags.append(m[0]); ww.append(float(w))
 
         if len(mags) < int(min_cmp):
             continue
-
         wsum = sum(ww)
         if wsum <= 0:
             continue
@@ -392,7 +497,7 @@ def _build_one_curve(
 
     return int(target_id), {
         "cstars": cstars,
-        "cweights": ws.tolist(),
+        "cweights": [float(w) for w in w_arr.tolist()],
         "cstdevs": cstdevs,
         "points": points,
     }
@@ -538,15 +643,11 @@ def main(argv=None):
         print(style.prefix)
         print(f"{style.prefix}Processing filter {pf} ...")
 
-        times, star_to_points = _collect_filter_data(in_eng, pf, min_snr=float(opts.min_snr))
+        _times_all, star_to_points = _collect_filter_data(in_eng, pf, min_snr=float(opts.min_snr))
         nstars = len(star_to_points)
-        print(f"{style.prefix}{nstars} stars with usable photometry; {len(times)} timestamps.")
-        if nstars == 0 or len(times) == 0:
+        print(f"{style.prefix}{nstars} stars with usable photometry.")
+        if nstars == 0:
             continue
-
-        ranking = _rank_comparison_stars(star_to_points, robust=bool(opts.robust))
-        ranking_map = {sid: sd for sid, sd in ranking}
-        cmp_pool = _build_cmp_pool(ranking, max_cmp=int(opts.max_cmp))
 
         # Parallel curve computation (compute only; all DB I/O is serialized)
         work_ids = sorted(star_to_points.keys())
@@ -556,7 +657,11 @@ def main(argv=None):
         with cf.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
             futs = [
                 ex.submit(
-                    _build_one_curve, sid, pf, times, star_to_points, cmp_pool, ranking_map, int(opts.min_cmp)
+                    _build_one_curve,
+                    sid, pf, star_to_points,
+                    max_cmp=int(opts.max_cmp),
+                    min_cmp=int(opts.min_cmp),
+                    robust=bool(opts.robust),
                 )
                 for sid in work_ids
             ]
@@ -581,8 +686,15 @@ def main(argv=None):
             for sid, payload in results:
                 if not payload["cstars"]:
                     continue
+                # Defensive: single normalization per (star, filter)
+                wsum = sum(payload["cweights"])
+                if wsum > 0:
+                    norm_w = [w / wsum for w in payload["cweights"]]
+                else:
+                    norm_w = payload["cweights"]
+
                 rows = []
-                for c, w, sd in zip(payload["cstars"], payload["cweights"], payload["cstdevs"]):
+                for c, w, sd in zip(payload["cstars"], norm_w, payload["cstdevs"]):
                     rows.append({"star_id": int(sid), "filter_id": int(f_id),
                                  "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
                 by_star[int(sid)] = rows

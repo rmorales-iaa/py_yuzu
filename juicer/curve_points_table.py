@@ -119,7 +119,7 @@ class CurvePointsTable(Gtk.Box):
         clear()
         set_rows(rows)           # rows: Iterable[(idx, t, mag, snr)]
                                  #   t: epoch seconds (float/int) or str
-        select_and_scroll(pos)   # safely select & scroll
+        select_and_scroll(pos)   # safely select & scroll (explicit user action)
         scroll_to(pos)           # safely scroll only
     """
     def __init__(self, title: str = "Data points") -> None:
@@ -178,7 +178,7 @@ class CurvePointsTable(Gtk.Box):
                 lbl.add_css_class("cpts-cell")
                 lbl.add_css_class("monospace")
                 lbl.set_hexpand(True)
-                lbl.set_selectable(True)
+                lbl.set_selectable(True)  # allow copy, but doesn't select rows
             row_box.append(l_id); row_box.append(l_dt); row_box.append(l_mg); row_box.append(l_sn)
             li.set_child(row_box)
 
@@ -198,14 +198,18 @@ class CurvePointsTable(Gtk.Box):
         factory.connect("setup", setup)
         factory.connect("bind", bind)
 
-        # Use SingleSelection so we can keep/restore selection robustly
+        # Selection: allow unselect, do not autoselect; start with nothing selected
         self._selection: Gtk.SingleSelection = Gtk.SingleSelection.new(self._store)  # type: ignore
-        self._selection.set_can_unselect(False)
+        self._selection.set_can_unselect(True)
+        self._selection.set_autoselect(False)
+        self._selection.set_selected(Gtk.INVALID_LIST_POSITION)
         self._selection.connect("notify::selected", self._on_selected_changed)
 
         self._list_view: Gtk.ListView = Gtk.ListView.new(self._selection, factory)
         self._list_view.add_css_class("lemon-surface")
         self._list_view.set_vexpand(True)
+        # On map, some themes/focus chains try to select row 0; force clear
+        self._list_view.connect("map", lambda *_: self._selection.set_selected(Gtk.INVALID_LIST_POSITION))
 
         # Keep selection sane on data changes
         self._store.connect("items-changed", self._on_items_changed)
@@ -237,11 +241,9 @@ class CurvePointsTable(Gtk.Box):
         if n <= 0:
             return
         pos = self._clamp(pos)
-        # Gtk.ListView.scroll_to(position, flags, Rect?) ? keep it simple
         try:
             self._list_view.scroll_to(pos, Gtk.ListScrollFlags.NONE, None)
         except Exception:
-            # Nothing else we can safely do here
             pass
 
     def _safe_select(self, pos: int) -> None:
@@ -256,7 +258,7 @@ class CurvePointsTable(Gtk.Box):
             pass
 
     def select_and_scroll(self, pos: int) -> None:
-        """Public API: safely select row and scroll to it."""
+        """Explicit selection (used only if user action demands a row highlighted)."""
         n = self._count()
         if n <= 0:
             return
@@ -265,7 +267,7 @@ class CurvePointsTable(Gtk.Box):
         self._safe_scroll(pos)
 
     def scroll_to(self, pos: int) -> None:
-        """Public API: safely scroll without changing selection."""
+        """Scroll without changing selection."""
         self._safe_scroll(pos)
 
     # ---- Signals
@@ -276,17 +278,19 @@ class CurvePointsTable(Gtk.Box):
             self._last_pos = int(sel)
 
     def _on_items_changed(self, *_args) -> None:
-        # After inserts/removals keep selection within range
         n = self._count()
         if n <= 0:
             return
-        self.select_and_scroll(self._last_pos)
+        # Keep scroll position, but ensure no row is selected
+        self._selection.set_selected(Gtk.INVALID_LIST_POSITION)
+        self.scroll_to(self._last_pos)
 
     # ---- API
 
     def clear(self) -> None:
         self._store.splice(0, self._store.get_n_items(), [])
         self._last_pos = 0
+        self._selection.set_selected(Gtk.INVALID_LIST_POSITION)
 
     def _fmt_time(self, t: Union[str, float, int]) -> str:
         if isinstance(t, str):
@@ -303,7 +307,7 @@ class CurvePointsTable(Gtk.Box):
         self,
         rows: Iterable[Tuple[int, Union[str, float, int], float, Optional[float]]]
     ) -> None:
-        """Bulk update rows and restore previous selection safely."""
+        """Bulk update rows and keep nothing selected by default."""
         items: list[CurveRow] = []
         for idx, t, mag, snr in rows:
             dt = self._fmt_time(t)
@@ -320,9 +324,10 @@ class CurvePointsTable(Gtk.Box):
                     snr_str = str(snr)
             items.append(CurveRow(int(idx), dt, mag_str, snr_str))
 
-        # splice in one go (fast, avoids multiple "items-changed")
+        # Splice in one go (fast, avoids multiple "items-changed")
         self._store.splice(0, self._store.get_n_items(), items)
 
-        # restore (or pick first) safely
+        # Scroll to previous viewport position; ensure no selection
         if self._count() > 0:
-            self.select_and_scroll(self._last_pos)
+            self.scroll_to(self._last_pos)
+        self._selection.set_selected(Gtk.INVALID_LIST_POSITION)
