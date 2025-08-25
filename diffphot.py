@@ -64,7 +64,7 @@ parser.add_argument("--overwrite", action="store_true", help="overwrite OUTPUT_D
 parser.add_argument(
     "--cores",
     type=int,
-    default=max(1, min(8, getattr(defaults, "ncores", multiprocessing.cpu_count()))),
+    default=max(1, getattr(defaults, "ncores", multiprocessing.cpu_count())),
     help="parallel workers for curve building",
 )
 parser.add_argument("--filter", action="append", dest="filters", default=None,

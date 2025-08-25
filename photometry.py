@@ -255,7 +255,7 @@ parser.add_argument("--gain", action="store", type=float, dest="gain", default=N
 parser.add_argument("--annuli", action="store", type=str, dest="json_annuli", default=None,
                     help="read apertures/annuli from a JSON file produced by the 'annuli' command.")
 parser.add_argument("--cores", action="store", type=int, dest="ncores",
-                    default=max(1, min(8, getattr(defaults, "ncores", multiprocessing.cpu_count()))),
+                    default=max(1, getattr(defaults, "ncores", multiprocessing.cpu_count())),
                     help=defaults.desc.get("ncores", "parallel workers for photometry"))
 parser.add_argument("-v", "--verbose", action="count", dest="verbose", default=defaults.verbosity,
                     help=defaults.desc.get("verbosity", ""))
