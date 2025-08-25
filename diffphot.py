@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-diffphot.py ? LEMON differential photometry (SQLAlchemy Core, thread-safe I/O)
+diffphot.py — LEMON differential photometry (SQLAlchemy Core, thread-safe I/O)
 
 - Reads raw photometry from INPUT_DB (SQLAlchemy Core engine)
 - For each filter:
-    ? ranks stars by scatter (robust or std)
-    ? picks a pool of low-scatter comparison stars
-    ? builds differential light curves (target ? weighted mean of comps at same time)
+    · ranks stars by scatter (robust or std)
+    · picks a pool of low-scatter comparison stars
+    · builds differential light curves (target − weighted mean of comps at same time)
 - Writes to OUTPUT_DB (SQLAlchemy Core):
-    ? ensures schema exists
-    ? copies stars & images
-    ? cmp_stars rows (per target/filter)
-    ? light_curves rows (differential points)
+    · ensures schema exists
+    · copies stars & images
+    · cmp_stars rows (per target/filter)
+    · light_curves rows (differential points)
+    · creates a compatibility `photometry` VIEW (or TABLE on old SQLite) mapped to `light_curves`
 
 All DB writes are serialized to avoid SQLite locks. No database.LEMONdB sessions.
 """
@@ -397,6 +398,93 @@ def _build_one_curve(
     }
 
 # ------------------------------------------------------------------------------
+# Compatibility layer: create photometry VIEW (or TABLE) from light_curves
+# ------------------------------------------------------------------------------
+
+def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
+    with eng.connect() as con:
+        v = con.execute(text("SELECT sqlite_version()")).scalar_one()
+    parts: List[int] = []
+    for tok in str(v).split("."):
+        try:
+            parts.append(int(tok))
+        except Exception:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])  # type: ignore[return-value]
+
+def _ensure_photometry_compat(out_eng) -> None:
+    """
+    If `photometry` doesn't exist but `light_curves` does, create a
+    compatibility layer so code that expects `photometry` keeps working.
+
+    Preference:
+      1) Create a VIEW `photometry` selecting from `light_curves` with a ROW_NUMBER() id
+         (requires SQLite >= 3.25).
+      2) Else materialize a TABLE `photometry` and bulk-copy from `light_curves`.
+    """
+    with out_eng.connect() as con:
+        has_photometry = bool(con.execute(
+            text("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='photometry'")
+        ).fetchone())
+        has_light_curves = bool(con.execute(
+            text("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='light_curves'")
+        ).fetchone())
+
+    if has_photometry or not has_light_curves:
+        return  # nothing to do
+
+    major, minor, patch = _sqlite_version_tuple(out_eng)
+    can_row_number = (major, minor, patch) >= (3, 25, 0)
+
+    try:
+        with out_eng.begin() as con:
+            if can_row_number:
+                # Create a compatibility VIEW with an id
+                con.execute(text("DROP VIEW IF EXISTS photometry"))
+                con.execute(text(
+                    """
+                    CREATE VIEW photometry AS
+                    SELECT
+                        ROW_NUMBER() OVER ()            AS id,
+                        lc.star_id                      AS star_id,
+                        lc.image_id                     AS image_id,
+                        lc.magnitude                    AS magnitude,
+                        COALESCE(lc.snr, 0.0)           AS snr
+                    FROM light_curves lc
+                    """
+                ))
+            else:
+                # Materialize a real table with sane schema and indexes
+                con.execute(text(
+                    """
+                    CREATE TABLE IF NOT EXISTS photometry (
+                      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                      star_id   INTEGER NOT NULL,
+                      image_id  INTEGER NOT NULL,
+                      magnitude REAL    NOT NULL,
+                      snr       REAL    NOT NULL,
+                      UNIQUE (star_id, image_id)
+                    )
+                    """
+                ))
+                # Populate from light_curves
+                con.execute(text(
+                    """
+                    INSERT OR IGNORE INTO photometry (star_id, image_id, magnitude, snr)
+                    SELECT lc.star_id, lc.image_id, lc.magnitude, COALESCE(lc.snr, 0.0)
+                    FROM light_curves lc
+                    """
+                ))
+                # Indexes for common lookups
+                con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_star_image ON photometry(star_id, image_id)"))
+                con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_image ON photometry(image_id)"))
+    except Exception as e:
+        # Non-fatal: leave DB as-is; downstream tools can read light_curves directly
+        logging.warning("Failed to create photometry compatibility layer: %s", e)
+
+# ------------------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------------------
 
@@ -463,7 +551,7 @@ def main(argv=None):
         # Parallel curve computation (compute only; all DB I/O is serialized)
         work_ids = sorted(star_to_points.keys())
         workers = max(1, getattr(defaults, "ncores", multiprocessing.cpu_count()))
-        print(f"{style.prefix}Building differential light curves in parallel ({workers} workers)...")
+        print(f"{style.prefix}Building differential light curves in parallel ({workers} workers).")
         results: List[Tuple[int, dict]] = []
         with cf.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
             futs = [
@@ -478,7 +566,7 @@ def main(argv=None):
                 except Exception as e:
                     logging.debug("curve worker failed for a star: %s", e)
                 if level <= logging.INFO and (i % max(1, len(work_ids)//10) == 0):
-                    print(f"{style.prefix}  ... {i}/{len(work_ids)}", flush=True)
+                    print(f"{style.prefix}  . {i}/{len(work_ids)}", flush=True)
 
         # Serialize DB writes (avoid locks)
         print(f"{style.prefix}Saving light curves to the database...")
@@ -548,6 +636,10 @@ def main(argv=None):
     except Exception:
         pass
 
+    # Create compatibility photometry view/table
+    _ensure_photometry_compat(out_eng)
+
+    # ANALYZE to refresh stats
     print(f"{style.prefix}Analyzing database statistics...", end="")
     sys.stdout.flush()
     try:
