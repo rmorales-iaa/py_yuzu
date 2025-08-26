@@ -118,16 +118,49 @@ def _dms_from_deg(dec_deg: float) -> str:
     return f"{sign}{d:02d}:{m:02d}:{s:05.2f}"
 
 
+# ---------------- Color sanitization (prevents GTK CSS parse errors) ----------------
+def _san_color(val: str, default_hex: str) -> str:
+    """
+    Accept hex (#rgb/#rgba/#rrggbb/#rrggbbaa), rgb(), rgba(), hsl(), hsla(), or 'transparent'.
+    Fallback to default_hex on anything else (including empty/None).
+    """
+    try:
+        s = (val or "").strip().lower()
+    except Exception:
+        s = ""
+    if not s:
+        return default_hex
+    if s == "transparent":
+        return s
+    if s.startswith("#"):
+        n = len(s)
+        return s if n in (4, 5, 7, 9) else default_hex
+    if s.startswith(("rgb(", "rgba(", "hsl(", "hsla(")):
+        return s
+    if s in {"black", "white", "gray", "grey", "red", "green", "blue", "yellow", "orange", "purple", "cyan"}:
+        return s
+    return default_hex
+
 # ---------------- Main Window ----------------
 class LEMONJuicerWindow(Gtk.ApplicationWindow):
     """GTK4 window with a ColumnView listing stars from the DB (no .ui files)."""
 
-    def __init__(self, app: Gtk.Application, title_suffix: str = "",
+    def __init__(self, app: Optional[Gtk.Application] = None, title_suffix: str = "",
                  autoselect_radec: Optional[tuple[float, float]] = None):
         # Geometry from config
         width  = _cfg_get_int("main_window", "width", 1200)
         height = _cfg_get_int("main_window", "height", 800)
-        super().__init__(application=app, title=f"yuzu juicer{title_suffix}")
+        # Allow constructing without an app (prevents __init__ missing 'app')
+        try:
+            if app is None:
+                app = Gtk.Application.get_default()
+            if app is not None:
+                super().__init__(application=app, title=f"yuzu juicer{title_suffix}")
+            else:
+                super().__init__(title=f"yuzu juicer{title_suffix}")
+        except Exception:
+            # Last-resort: construct with minimal args
+            super().__init__(title=f"yuzu juicer{title_suffix}")
         self.set_default_size(width, height)
 
         # One-shot autoselection (degrees)
@@ -153,39 +186,66 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         # ---- Theme from [theme] ----
         _FONT_NAME   = _cfg_get("theme", "font_name", "Cantarell")
         _FONT_SIZEPT = _cfg_get_int("theme", "font_size", 11)
-        _BG          = _cfg_get("theme", "background", "#2a2f38")
-        _FG          = _cfg_get("theme", "foreground", "#e7ebef")
-        _ACCENT      = _cfg_get("theme", "accent",    "#ffd84d")
-        _DIVIDER     = _cfg_get("theme", "divider",   "#ffd84d")
-        _DIV_W       = _cfg_get_int("theme", "divider_width_px", 1)
-        _SEL_BG      = _cfg_get("theme", "row_selected", "#375a7f")
-        _SEL_FG      = _ACCENT
-        _HEADER_BG        = "#1f4aa8"
-        _HEADER_BG_HOVER  = "#2456bf"
-        _HEADER_BG_ACTIVE = "#1a3e8f"
+        # Validate/sanitize colors to avoid GTK "Expected a valid color" warnings
+        _BG          = _san_color(_cfg_get("theme", "background", "#2a2f38"), "#2a2f38")
+        _FG          = _san_color(_cfg_get("theme", "foreground", "#e7ebef"), "#e7ebef")
+        _ACCENT      = _san_color(_cfg_get("theme", "accent",    "#ffd84d"), "#ffd84d")
+        # Dark-yellow grid lines
+        _DIVIDER     = _san_color(_cfg_get("theme", "divider",   "#c9a000"), "#c9a000")
+        _SEL_BG      = _san_color(_cfg_get("theme", "sel_row_bg",
+                                           _cfg_get("theme", "accent_ok", "#0b3d2e")), "#0b3d2e")
+        _SEL_FG      = _san_color(_cfg_get("theme", "sel_row_fg", "#ffffff"), "#ffffff")
+        _HEADER_BG        = _san_color(_cfg_get("theme", "section_bg", "#1f4aa8"), "#1f4aa8")
+        _HEADER_BG_HOVER  = _san_color("#2456bf", "#2456bf")
+        _HEADER_BG_ACTIVE = _san_color("#1a3e8f", "#1a3e8f")
 
         # ---------- CSS ----------
         provider = Gtk.CssProvider()
         css = f"""
         * {{ font-family: '{_FONT_NAME}'; font-size: {_FONT_SIZEPT}pt; }}
+
+        /* ColumnView surface + text */
         columnview.lemon-dark listview {{ background-color: {_BG}; }}
         columnview.lemon-dark label {{ color: {_FG}; }}
+
+        /* Selected row styling (dark green, consistent with other windows) */
         columnview.lemon-dark listview row:selected,
         columnview.lemon-dark listitem:selected {{ background-color: {_SEL_BG}; }}
         columnview.lemon-dark listview row:selected label,
         columnview.lemon-dark listitem:selected label {{ color: {_SEL_FG}; }}
-        .lemon-vsep {{ background-color: {_DIVIDER}; margin-left: 6px; }}
-        .lemon-last .lemon-vsep {{ background-color: transparent; margin-left: 0; }}
-        columnview.lemon-dark > header, columnview.lemon-dark > header > * {{
-          background-color: {_HEADER_BG}; color: #fff;
+
+        /* Column header (incl. divider at bottom and between buttons) */
+        columnview.lemon-dark > header,
+        columnview.lemon-dark > header > * {{
+          background-color: {_HEADER_BG};
+          color: #fff;
+        }}
+        columnview.lemon-dark > header {{
+          border-bottom: 1px solid {_DIVIDER};
         }}
         columnview.lemon-dark > header button {{
-          background-color: {_HEADER_BG}; color: #fff; font-weight: 600;
-          padding: 6px 8px; border-right: 1px solid {_DIVIDER}; border-top: 0; border-bottom: 0;
+          background-color: {_HEADER_BG};
+          color: #fff;
+          font-weight: 600;
+          padding: 6px 8px;
+          border-right: 1px solid {_DIVIDER};
+          border-top: 0;
+          border-bottom: 0;
         }}
         columnview.lemon-dark > header button:hover {{ background-color: {_HEADER_BG_HOVER}; }}
         columnview.lemon-dark > header button:active,
         columnview.lemon-dark > header button:checked {{ background-color: {_HEADER_BG_ACTIVE}; }}
+
+        /* ROW CELL grid lines */
+        .cv-cell {{
+          padding: 6px 8px;
+          border-bottom: 1px solid {_DIVIDER};  /* horizontal rule */
+        }}
+        .cv-left {{
+          border-left: 1px solid {_DIVIDER};    /* vertical rule for non-first cells */
+        }}
+
+        /* Status bar */
         .lemon-statusbar {{ background-color: {_BG}; padding: 6px 10px; }}
         .lemon-statusbar * {{ color: {_ACCENT}; }}
         """
@@ -250,45 +310,31 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                              *, width_px: int | None,
                              xalign: float, monospace: bool = True,
                              expand: bool = False,
-                             is_last: bool = False) -> Gtk.ColumnViewColumn:
+                             is_first: bool = False) -> Gtk.ColumnViewColumn:
             factory = Gtk.SignalListItemFactory()
 
             def setup(_f, li: Gtk.ListItem):
-                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-                if is_last: box.add_css_class("lemon-last")
                 lbl = Gtk.Label(xalign=xalign)
                 lbl.set_single_line_mode(True)
                 lbl.set_ellipsize(Pango.EllipsizeMode.END)
-                if monospace: lbl.add_css_class("monospace")
+                if monospace:
+                    lbl.add_css_class("monospace")
+                # Apply grid styling
+                lbl.add_css_class("cv-cell")
+                if not is_first:
+                    lbl.add_css_class("cv-left")
                 lbl.set_hexpand(True)
-                box.append(lbl)
-                sep = Gtk.Box()
-                sep.add_css_class("lemon-vsep")
-                sep.set_hexpand(False); sep.set_vexpand(True)
-                sep.set_size_request(max(1, _CFG_DIV_W()), -1)
-                if is_last: sep.set_visible(False)
-                box.append(sep)
-                li.set_child(box)
+                li.set_child(lbl)
 
             def bind(_f, li: Gtk.ListItem):
                 row: StarRow | None = li.get_item()
                 txt = get_text(row) if row is not None else ""
-                box = li.get_child()
-                lbl = box.get_first_child()
+                lbl = li.get_child()
                 if isinstance(lbl, Gtk.Label):
                     lbl.set_text(txt)
-
-                # Track row widget
-                try:
-                    pos = li.get_position()
-                    if isinstance(pos, int) and pos >= 0:
-                        self._row_widgets[pos] = box
-                except Exception:
-                    pass
-
                 # First height measurement
                 try:
-                    alloc = box.get_allocation()
+                    alloc = lbl.get_allocation()
                     h = getattr(alloc, "height", 0) or 0
                     if h > 0 and self._row_height_px is None:
                         self._row_height_px = int(h)
@@ -297,9 +343,9 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
 
             def unbind(_f, li: Gtk.ListItem):
                 try:
-                    box = li.get_child()
+                    lbl = li.get_child()
                     for k, v in list(self._row_widgets.items()):
-                        if v is box:
+                        if v is lbl:
                             self._row_widgets.pop(k, None)
                 except Exception:
                     pass
@@ -315,29 +361,23 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                 col.set_fixed_width(width_px)
             return col
 
-        def _CFG_DIV_W() -> int:
-            try:
-                return _cfg_get_int("theme", "divider_width_px", 1)
-            except Exception:
-                return 1
-
         # Columns
         col_id = make_text_column(
             "ID",
             lambda r: "" if r is None else f"{int(getattr(r.props, 'id', 0))}",
-            width_px=_W_ID, xalign=1.0, monospace=True, expand=False, is_last=False,
+            width_px=_W_ID, xalign=1.0, monospace=True, expand=False, is_first=True,
         ); self._view.append_column(col_id)
 
         col_ra = make_text_column(
             "RA (hms)",
             lambda r: "" if r is None else _hms_from_deg(float(getattr(r.props, "ra", 0.0))),
-            width_px=_W_RA, xalign=0.0, monospace=True, expand=True, is_last=False,
+            width_px=_W_RA, xalign=0.0, monospace=True, expand=True, is_first=False,
         ); self._view.append_column(col_ra)
 
         col_dec = make_text_column(
             "Dec (dms)",
             lambda r: "" if r is None else _dms_from_deg(float(getattr(r.props, "dec", 0.0))),
-            width_px=_W_DEC, xalign=0.0, monospace=True, expand=True, is_last=False,
+            width_px=_W_DEC, xalign=0.0, monospace=True, expand=True, is_first=False,
         ); self._view.append_column(col_dec)
 
         col_mag = make_text_column(
@@ -348,7 +388,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                            and math.isnan(float(getattr(r.props, "imag", float('nan'))))))
                 else f"{float(getattr(r.props, 'imag', float('nan'))):.3f}"
             ),
-            width_px=_W_MAG, xalign=1.0, monospace=True, expand=False, is_last=True,
+            width_px=_W_MAG, xalign=1.0, monospace=True, expand=False, is_first=False,
         ); self._view.append_column(col_mag)
 
         # Sorters
@@ -471,12 +511,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
                     n = len(curve) if curve else 0
                     if n > default_n:
                         default_n = n
-                        # Prefer a human-friendly name; fall back to id
-                        default_filt = getattr(pf, "name", None)
-                        if default_filt is None:
-                            default_filt = getattr(pf, "letter", None)
-                        if default_filt is None:
-                            default_filt = getattr(pf, "id", None)
+                        default_filt = getattr(pf, "name", None) or getattr(pf, "letter", None) or getattr(pf, "id", None)
             except Exception:
                 pass
 
@@ -544,7 +579,7 @@ class LEMONJuicerWindow(Gtk.ApplicationWindow):
         miner = Miner(db_path)
         self._miner = miner
         self._db_path = db_path
-        self.set_title(f"yuzu juicer {Path(db_path).name}")
+        self.set_title(f"yuzu {Path(db_path).name}")
         logger.info("Opened database: %s", db_path)
         self._populate_overview_from_miner(miner)
 

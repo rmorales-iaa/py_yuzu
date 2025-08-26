@@ -6,7 +6,7 @@ import os
 import csv
 import sys
 import datetime as _dt
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union, Dict, Sequence
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -17,7 +17,7 @@ from gi.repository import Gtk, Gio, GLib, Gdk  # type: ignore
 from .light_curve_view import LightCurveView
 from .star_info_panel import StarInfoPanel
 from .comparison_stars_table import ReferenceStarsTable
-from .curve_points_table import CurvePointsTable
+from .light_curve_points_table import CurvePointsTable
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,25 @@ def _format_mag(x: Optional[float]) -> str:
     except Exception:
         return str(x)
 
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if math.isfinite(f):
+            return f
+    except Exception:
+        pass
+    return None
+
+def _pick_num(d: Dict[str, Any], keys: Sequence[str]) -> Optional[float]:
+    for k in keys:
+        if k in d and d[k] is not None:
+            f = _to_float(d[k])
+            if f is not None:
+                return f
+    return None
+
 # ---------------- curve helpers ----------------
 def _curve_to_points(curve: Any) -> List[Tuple[float, float, Optional[float]]]:
     if curve is None:
@@ -190,9 +209,12 @@ class StarDetailsWindow(Gtk.Window):
         self._parent = parent
         self._miner  = miner
         self._data   = dict(row_as_dict or {})
-        self._export_rows_refs: List[Tuple[int, Optional[float], Optional[float]]] = []
+        self._export_rows_refs: List[Tuple[int, Optional[float], Optional[float], Optional[float]]] = []
         self._export_rows_pts:  List[Tuple[int, float, float, Optional[float]]] = []
         self._used_filter: Optional[str] = None
+
+        # cache of cstar_id -> mag for table & export
+        self._mag_cache: Dict[int, float] = {}
 
         # Layout
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -236,8 +258,10 @@ class StarDetailsWindow(Gtk.Window):
 
         # Bottom panels: reference table + data points table
         self.refs   = ReferenceStarsTable("Comparison stars")
-        self.points = CurvePointsTable("Data points")
+        # attach a lookup so mag is filled even if rows lack it
+        self.refs.set_mag_lookup(self._lookup_mag)
 
+        self.points = CurvePointsTable("Light curve data points")
         self.bottom_paned.set_start_child(self.refs)
         self.bottom_paned.set_end_child(self.points)
 
@@ -297,13 +321,56 @@ class StarDetailsWindow(Gtk.Window):
         self.info.set("npts", str(self._data.get("n_points")) if self._data.get("n_points") is not None else "?")
 
     # -------- populate panels (helpers) --------
-    def _panel_set_refs_rows(self, rows: List[Tuple[int, Optional[float], Optional[float]]]) -> None:
+    def _panel_set_refs_rows(self, rows: List[Tuple[int, Optional[float], Optional[float], Optional[float]]]) -> None:
+        # rows: (cstar_id, weight, sigma, mag)
         self._export_rows_refs = rows[:]
         self.refs.set_rows(rows)
 
     def _panel_set_cpoints_rows(self, rows: List[Tuple[int, float, float, Optional[float]]]) -> None:
         self._export_rows_pts = rows[:]
         self.points.set_rows(rows)
+
+    # -------- mag lookup for table (fallback path) --------
+    def _lookup_mag(self, star_id: int) -> Optional[float]:
+        # cached?
+        if star_id in self._mag_cache:
+            return self._mag_cache.get(star_id)
+
+        m = None
+        miner = self._miner
+        pf = self._used_filter
+
+        # Try a few likely miner APIs defensively
+        for fn_name in (
+            "get_inst_mag", "get_mag", "get_star_mag",
+        ):
+            fn = getattr(miner, fn_name, None)
+            if callable(fn):
+                try:
+                    m = fn(int(star_id), pf) if fn.__code__.co_argcount >= 3 else fn(int(star_id))  # type: ignore[attr-defined]
+                    m = _to_float(m)
+                    if m is not None:
+                        break
+                except Exception:
+                    pass
+
+        if m is None:
+            # Try a dict info getter and pick a mag-like field
+            for fn_name in ("get_star_info", "get_cmp_star_info", "get_star"):
+                fn = getattr(miner, fn_name, None)
+                if callable(fn):
+                    try:
+                        info = fn(int(star_id), pf) if fn.__code__.co_argcount >= 3 else fn(int(star_id))  # type: ignore[attr-defined]
+                    except Exception:
+                        info = None
+                    if isinstance(info, dict):
+                        m = _pick_num(info, ("imag", "mag", "i_mag", "inst_mag", "mag_i", "mag_inst"))
+                        if m is not None:
+                            break
+
+        if m is not None:
+            self._mag_cache[star_id] = m
+        return m
 
     # -------- dynamic load --------
     def _load_dynamic(self) -> bool:
@@ -335,8 +402,10 @@ class StarDetailsWindow(Gtk.Window):
         self._panel_set_cpoints_rows(rows_pts)
 
         # Comparison stars: prefer rich info; fallback to raw tuples
-        rows_refs: List[Tuple[int, Optional[float], Optional[float]]] = []
+        rows_refs: List[Tuple[int, Optional[float], Optional[float], Optional[float]]] = []
         info_rows: Optional[List[dict]] = None
+        self._mag_cache.clear()
+
         try:
             info_rows = miner.get_cmp_stars_info(int(sid), used_pf)
             if not info_rows and used_pf is None:
@@ -347,19 +416,28 @@ class StarDetailsWindow(Gtk.Window):
         if info_rows:
             for d in info_rows:
                 try:
-                    rows_refs.append((
-                        int(d["cstar_id"]),
-                        None if d.get("weight") is None else float(d["weight"]),
-                        None if d.get("stdev")  is None else float(d["stdev"]),
-                    ))
+                    cid = int(d.get("cstar_id") or d.get("id") or d.get("star_id"))
                 except Exception:
                     continue
+                wt   = _to_float(d.get("weight"))
+                # treat sigma as stdev alias if that's what we have
+                sig  = _pick_num(d, ("sigma", "stdev"))
+                mag  = _pick_num(d, ("imag", "mag", "i_mag", "inst_mag", "mag_i", "mag_inst"))
+                if mag is not None:
+                    self._mag_cache[cid] = mag
+                rows_refs.append((cid, wt, sig, mag))
         else:
+            # Fallback: weight/sigma only; mag looked up via hook
             try:
                 raw = miner.get_cmp_stars(int(sid), used_pf) or []
                 if not raw and used_pf is None:
                     raw = miner.get_cmp_stars(int(sid), None) or []
-                rows_refs = [(int(cid), float(w), float(st)) for (cid, w, st) in raw]
+                for tup in raw:
+                    try:
+                        cid = int(tup[0]); wt = _to_float(tup[1]); sig = _to_float(tup[2])
+                    except Exception:
+                        continue
+                    rows_refs.append((cid, wt, sig, None))  # mag will be resolved by lookup
             except Exception:
                 rows_refs = []
 
@@ -503,11 +581,14 @@ class StarDetailsWindow(Gtk.Window):
             refs_csv = os.path.join(out_dir, _EXP_REFS_CSV)
             with open(refs_csv, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["id", "weight", "sigma"])
-                for sidr, wt, st in self._export_rows_refs:
-                    w.writerow([sidr,
-                                "" if wt is None else f"{wt:.6f}",
-                                "" if st is None else f"{st:.6f}"])
+                w.writerow(["id", "weight", "sigma", "mag"])
+                for sidr, wt, st, mag in self._export_rows_refs:
+                    w.writerow([
+                        sidr,
+                        "" if wt  is None else f"{wt:.6f}",
+                        "" if st  is None else f"{st:.6f}",
+                        "" if mag is None else f"{mag:.6f}",
+                    ])
 
             # points CSV
             pts_csv = os.path.join(out_dir, _EXP_PTS_CSV)

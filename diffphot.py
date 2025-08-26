@@ -2,22 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-diffphot.py ? LEMON differential photometry (SQLAlchemy Core, thread-safe I/O)
+diffphot.py — Differential photometry (LEMON/Broeg-style) with SQLAlchemy Core.
 
-- Reads raw photometry from INPUT_DB (SQLAlchemy Core engine)
-- For each filter:
-    · builds comparison-star sets **per target** using residual scatter
-      (leave-one-out ensemble, iterative worst-fraction pruning)
-    · builds differential light curves:
-        target mag - weighted mean of comparisons at the same time
-- Writes to OUTPUT_DB (SQLAlchemy Core):
-    · ensures schema exists
-    · copies stars & images
-    · cmp_stars rows (per target/filter)
-    · light_curves rows (differential points)
-    · creates a compatibility `photometry` VIEW (or TABLE on old SQLite) mapped to `light_curves`
+Features:
+  • Per-filter differential photometry using an artificial comparison star.
+  • Optional LEMON-compat behavior:
+      - mean baseline (instead of median),
+      - allow missing comparison measurements,
+      - per-epoch weight re-normalization.
+  • Comparison set trimming by worst-fraction of residual scatter, iteratively.
+  • Writes: stars, images, cmp_stars, light_curves, and a compat photometry VIEW/TABLE.
+  • Debug tracer: --debug-star (and optional --debug-filter).
+  • NEW: Console progress bar for the parallel curve build (auto-enabled on TTY).
 
-All DB writes are serialized to avoid SQLite locks. No database.LEMONdB sessions.
+CLI examples:
+  yuzu diffphot in.db out.db
+  yuzu diffphot in.db out.db --lemon-compat --debug-star 145 --debug-filter R -v
 """
 
 from __future__ import annotations
@@ -29,24 +29,38 @@ import logging
 import math
 import multiprocessing
 import os
+import shutil
 import socket
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 from sqlalchemy import create_engine, text
 
-import style
-import defaults
+# ---------------- style/default fallbacks ----------------
+try:
+    import style  # type: ignore
+except Exception:
+    class _Style:
+        prefix = ">> "
+        logging_format = "%(message)s"
+        error_exit_message = ""
+    style = _Style()  # type: ignore
 
-# ------------------------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------------------------
+try:
+    import defaults  # type: ignore
+except Exception:
+    class _Defaults:
+        ncores = multiprocessing.cpu_count()
+        verbosity = 0
+    defaults = _Defaults()  # type: ignore
 
+
+# ---------------- CLI ----------------
 description = """
-Compute differential photometry light curves from an existing photometry database.
+Compute differential photometry (Broeg+05 artificial comparison star) from a raw photometry DB.
 
 Usage:
   yuzu diffphot INPUT_DB OUTPUT_DB [options]
@@ -62,76 +76,151 @@ parser.usage = "%(prog)s [OPTION]... INPUT_DB OUTPUT_DB"
 parser.add_argument("input_db", help="LEMON database with raw photometry")
 parser.add_argument("output_db", help="output LEMON database for differential light curves")
 
-parser.add_argument("--overwrite", action="store_true", help="overwrite OUTPUT_DB if it already exists")
-parser.add_argument(
-    "--cores",
-    type=int,
-    default=max(1, getattr(defaults, "ncores", multiprocessing.cpu_count())),
-    help="parallel workers for curve building",
-)
+parser.add_argument("--overwrite", action="store_true",
+                    help="overwrite OUTPUT_DB if it already exists")
+
+parser.add_argument("--cores", type=int,
+                    default=max(1, getattr(defaults, "ncores", multiprocessing.cpu_count())),
+                    help="parallel workers for curve building")
+
 parser.add_argument("--filter", action="append", dest="filters", default=None,
-                    help="process only this photometric filter (may be repeated)")
+                    help="process only this photometric filter (name; may be repeated)")
+
 parser.add_argument("--min-snr", type=float, default=1.0,
                     help="ignore photometric points with SNR below this threshold")
+
 parser.add_argument("--max-cmp", type=int, default=20,
-                    help="maximum number of comparison stars per target after pruning")
+                    help="maximum number of comparison stars per target")
+
 parser.add_argument("--min-cmp", type=int, default=5,
                     help="minimum number of valid comparison stars required per target time")
+
 parser.add_argument("--robust", action="store_true",
-                    help="use MAD-based robust scatter (else, std) when ranking residuals")
+                    help="use robust (MAD) dispersion instead of plain standard deviation")
+
+parser.add_argument("--worst-fraction", type=float, default=0.25,
+                    help="fraction of worst candidates to discard at each trimming step")
+
+parser.add_argument("--lemon-compat", action="store_true",
+                    help="LEMON-like ensemble: mean baseline, allow missing comp points, "
+                         "per-epoch weight re-normalization")
+
+# Debug tracer
+parser.add_argument("--debug-star", type=int, default=None,
+                    help="star ID to trace (candidate pool, trimming iterations, final weights)")
+parser.add_argument("--debug-filter", type=str, default=None,
+                    help="optional filter name to limit debug trace")
+
+# Progress bar control
+parser.add_argument("--no-progress", action="store_true",
+                    help="disable the live progress bar even if stdout is a TTY")
+parser.add_argument("--progress", action="store_true",
+                    help="force-enable the live progress bar even if stdout is not a TTY")
+
 parser.add_argument("-v", "--verbose", action="count", default=getattr(defaults, "verbosity", 0),
                     help="increase output verbosity (repeat for more)")
 
-# Internal heuristics (kept constant to avoid CLI sprawl)
-_DROP_FRAC = 0.20          # drop worst fraction each pruning iteration
-_MAX_ITER  = 5             # max pruning iters
-_MIN_OVERLAP_FRAC = 0.60   # candidate must cover this fraction of target epochs
-_MIN_POINTS_ABS   = 8      # and at least this many points
 
-# ------------------------------------------------------------------------------
-# Utilities (math)
-# ------------------------------------------------------------------------------
+# ---------------- lightweight progress bar ----------------
+class _Progress:
+    def __init__(self, total: int, label: str = "", enabled: bool = True):
+        self.total = max(0, int(total))
+        self.label = label
+        self.enabled = bool(enabled)
+        self.count = 0
+        self._last_render = ""
 
-def _robust_stdev(x: np.ndarray) -> float:
+    def _term_width(self) -> int:
+        try:
+            return shutil.get_terminal_size(fallback=(80, 24)).columns
+        except Exception:
+            return 80
+
+    def _render_line(self) -> str:
+        if self.total <= 0:
+            pct = 100.0
+            bar = "#" * 10
+            return f"{self.label} [{bar}] 100% ({self.count}/{self.total})"
+        pct = (self.count / self.total) * 100.0
+        width = max(10, self._term_width() - len(self.label) - 20)
+        filled = int(round(width * min(1.0, max(0.0, self.count / max(1, self.total)))))
+        bar = "#" * filled + "-" * (width - filled)
+        return f"{self.label} [{bar}] {pct:5.1f}% ({self.count}/{self.total})"
+
+    def update(self, step: int = 1) -> None:
+        if not self.enabled:
+            return
+        self.count = min(self.total, self.count + int(step))
+        line = self._render_line()
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+        self._last_render = line
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        self.count = self.total
+        line = self._render_line()
+        sys.stdout.write("\r" + line + "\n")
+        sys.stdout.flush()
+        self._last_render = ""
+
+    def clear_line(self) -> None:
+        if not self.enabled:
+            return
+        width = self._term_width()
+        sys.stdout.write("\r" + " " * width + "\r")
+        sys.stdout.flush()
+        self._last_render = ""
+
+    def print_above(self, text: str) -> None:
+        if not self.enabled:
+            print(text)
+            return
+        self.clear_line()
+        print(text)
+        # redraw current bar
+        if self.count < self.total:
+            sys.stdout.write("\r" + self._render_line())
+            sys.stdout.flush()
+
+
+# ---------------- math helpers ----------------
+def _mad_sigma(x: np.ndarray) -> float:
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("inf")
     med = np.median(x)
-    return 1.4826 * np.median(np.abs(x - med))
+    return float(1.4826 * np.median(np.abs(x - med)))
 
-def _plain_stdev(x: np.ndarray) -> float:
+def _std_sigma(x: np.ndarray) -> float:
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("inf")
-    return float(np.nanstd(x))
+    # population std; switch to ddof=1 if you want sample std
+    return float(np.std(x, ddof=0))
 
-def _sigma_fn(robust: bool):
-    return _robust_stdev if robust else _plain_stdev
+def _sigma(x: np.ndarray, robust: bool) -> float:
+    return _mad_sigma(x) if robust else _std_sigma(x)
 
-def _weight_from_stdev(sd: float) -> float:
-    if not math.isfinite(sd) or sd <= 0:
+def _invvar_weight(sd: float) -> float:
+    if not math.isfinite(sd) or sd <= 0.0:
         return 0.0
     return 1.0 / (sd * sd)
 
-# ------------------------------------------------------------------------------
-# DB helpers (SQLAlchemy Core only)
-# ------------------------------------------------------------------------------
 
+# ---------------- DB helpers ----------------
 def _engine_for(path: Path):
-    # SQLite file; pragma tuning kept minimal
     return create_engine(f"sqlite+pysqlite:///{path}", future=True)
 
-def _ensure_schema(eng):
-    """Create the minimal schema needed for diffphot output if it doesn't exist."""
+def _ensure_schema(eng) -> None:
     ddl = [
-        # photometric_filters
         """
         CREATE TABLE IF NOT EXISTS photometric_filters (
             id   INTEGER PRIMARY KEY,
             name TEXT UNIQUE NOT NULL
         );
         """,
-        # stars
         """
         CREATE TABLE IF NOT EXISTS stars (
             id     INTEGER PRIMARY KEY,
@@ -145,7 +234,6 @@ def _ensure_schema(eng):
             imag   REAL NOT NULL
         );
         """,
-        # images (UNIQUE(filter_id, unix_time) like photometry DB)
         """
         CREATE TABLE IF NOT EXISTS images (
             id        INTEGER PRIMARY KEY,
@@ -163,7 +251,6 @@ def _ensure_schema(eng):
         );
         """,
         "CREATE INDEX IF NOT EXISTS img_by_filter_time ON images(filter_id, unix_time);",
-        # light_curves (output of diffphot)
         """
         CREATE TABLE IF NOT EXISTS light_curves (
             id        INTEGER PRIMARY KEY,
@@ -177,7 +264,6 @@ def _ensure_schema(eng):
         );
         """,
         "CREATE INDEX IF NOT EXISTS curve_by_star_image ON light_curves(star_id, image_id);",
-        # cmp_stars (comparison star set and weights per target/filter)
         """
         CREATE TABLE IF NOT EXISTS cmp_stars (
             id        INTEGER PRIMARY KEY,
@@ -192,7 +278,6 @@ def _ensure_schema(eng):
         );
         """,
         "CREATE INDEX IF NOT EXISTS cstars_by_star_filter ON cmp_stars(star_id, filter_id);",
-        # metadata
         """
         CREATE TABLE IF NOT EXISTS metadata (
             key   TEXT NOT NULL,
@@ -210,15 +295,12 @@ def _list_filters(eng) -> List[str]:
         rows = con.execute(text("SELECT name FROM photometric_filters")).all()
     return sorted({str(r[0]) for r in rows if r[0] is not None})
 
-def _copy_stars_images(in_eng, out_eng):
-    """Copy STARS (preserving ids) and IMAGES (recreating rows) to the output DB."""
-    # STARS
+def _copy_stars_images(in_eng, out_eng) -> None:
+    # Stars
     with in_eng.connect() as cin:
         stars = cin.execute(text(
-            "SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag "
-            "FROM stars ORDER BY id ASC"
+            "SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag FROM stars ORDER BY id"
         )).all()
-
     with out_eng.begin() as cout:
         if stars:
             cout.execute(
@@ -240,7 +322,7 @@ def _copy_stars_images(in_eng, out_eng):
                 ],
             )
 
-    # IMAGES
+    # Images
     with in_eng.connect() as cin:
         imgs = cin.execute(text(
             "SELECT i.path, f.name, i.unix_time, i.object, i.airmass, i.gain, "
@@ -252,14 +334,17 @@ def _copy_stars_images(in_eng, out_eng):
 
     with out_eng.begin() as cout:
         # Ensure filters exist
-        fltnames = sorted({str(r[1]) for r in imgs if r[1] is not None})
+        fltnames = sorted({str(fname) for _p, fname, *_rest in imgs if fname is not None})
         for fn in fltnames:
-            cout.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"), {"n": fn})
+            cout.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
+                         {"n": str(fn)})
 
-        # Map name -> id
-        fids = {r[0]: r[1] for r in cout.execute(text("SELECT name, id FROM photometric_filters")).all()}
+        # Map names to ids
+        fids = {r[0]: r[1] for r in cout.execute(text(
+            "SELECT name, id FROM photometric_filters"
+        )).all()}
 
-        # Insert images; uniqueness is (filter_id, unix_time) so use OR IGNORE
+        # Insert images
         rows = []
         for path, fname, t, obj, am, g, ra, dec, src in imgs:
             if fname is None:
@@ -275,19 +360,18 @@ def _copy_stars_images(in_eng, out_eng):
                 sources=int(src or 0),
             ))
         if rows:
-            cout.execute(
-                text(
-                    "INSERT OR IGNORE INTO images "
-                    "(path, filter_id, unix_time, object, airmass, gain, ra, dec, sources) "
-                    "VALUES (:path, :filter_id, :unix_time, :object, :airmass, :gain, :ra, :dec, :sources)"
-                ),
-                rows,
-            )
+            cout.execute(text(
+                "INSERT OR IGNORE INTO images "
+                "(path, filter_id, unix_time, object, airmass, gain, ra, dec, sources) "
+                "VALUES (:path, :filter_id, :unix_time, :object, :airmass, :gain, :ra, :dec, :sources)"
+            ), rows)
 
-def _collect_filter_data(in_eng, pfilter: str, min_snr: float) -> Tuple[List[float], Dict[int, List[Tuple[float, float, float]]]]:
-    """Return (times, star_to_points) for this filter using SQL joins."""
-    star_to_points: Dict[int, List[Tuple[float, float, float]]] = {}
-    times_set = set()
+def _collect_filter_data(in_eng, pfilter: str, min_snr: float
+                         ) -> Tuple[Dict[int, List[Tuple[float, float, float]]],
+                                    Dict[int, List[float]]]:
+    """Return: (star_points, star_times)."""
+    star_points: Dict[int, List[Tuple[float, float, float]]] = {}
+    star_times: Dict[int, List[float]] = {}
     with in_eng.connect() as con:
         rows = con.execute(
             text(
@@ -304,14 +388,13 @@ def _collect_filter_data(in_eng, pfilter: str, min_snr: float) -> Tuple[List[flo
     for sid, t, m, snr in rows:
         if t is None or m is None or snr is None:
             continue
-        m = float(m); snr = float(snr)
-        if not math.isfinite(m) or snr < float(min_snr):
+        snr = float(snr)
+        if not math.isfinite(snr) or snr < float(min_snr):
             continue
-        sid_i = int(sid); t_f = float(t)
-        times_set.add(t_f)
-        star_to_points.setdefault(sid_i, []).append((t_f, m, snr))
+        star_points.setdefault(int(sid), []).append((float(t), float(m), float(snr)))
+        star_times.setdefault(int(sid), []).append(float(t))
 
-    return sorted(times_set), star_to_points
+    return star_points, star_times
 
 def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> int | None:
     with out_eng.connect() as con:
@@ -325,187 +408,261 @@ def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> int | None:
         ).scalar_one_or_none()
     return None if rid is None else int(rid)
 
-# ------------------------------------------------------------------------------
-# LEMON-style comparison set per target (residual scatter + pruning)
-# ------------------------------------------------------------------------------
 
-def _align_to_target_times(
-    target_times: List[float],
-    pts: List[Tuple[float, float, float]],
-) -> np.ndarray:
-    """Return vector of magnitudes aligned to target_times; NaN where missing."""
-    mp = {t: m for (t, m, _s) in pts}
-    arr = np.full((len(target_times),), np.nan, dtype=float)
-    for i, t in enumerate(target_times):
-        val = mp.get(t)
-        if val is not None and math.isfinite(val):
-            arr[i] = float(val)
-    return arr
-
-def _loo_ensemble_median(A: np.ndarray, j: int) -> np.ndarray:
-    """Leave-one-out median across columns (ignore NaNs). A is (T, K)."""
-    if A.shape[1] <= 1:
-        return np.full((A.shape[0],), np.nan)
-    keep = [k for k in range(A.shape[1]) if k != j]
-    return np.nanmedian(A[:, keep], axis=1)
-
-def _compute_cmp_weights_for_target(
+# ---------------- ensemble building ----------------
+def _matrix_for_target(
     target_id: int,
-    star_to_points: Dict[int, List[Tuple[float, float, float]]],
-    *,
-    robust: bool,
-    max_cmp: int,
-) -> Tuple[List[int], List[float], List[float], List[float]]:
+    star_points: Dict[int, List[Tuple[float, float, float]]],
+    star_times: Dict[int, List[float]],
+    allow_missing: bool = False,
+):
     """
-    Returns (cstar_ids, weights, sigmas, target_times).
-    - weights sum to 1 over the final set
-    - sigmas are final residual scatters per comp
-    - target_times is the sorted list of epochs for the target
+    Returns:
+      y      : target magnitudes aligned to T              (shape [T])
+      M      : candidate magnitudes aligned to T           (shape [C, T])
+               (NaN where missing if allow_missing=True)
+      cids   : candidate star IDs                          (len C)
+      T      : list of times (target times)                (len T)
     """
-    t_pts = star_to_points.get(int(target_id), [])
-    if not t_pts:
-        return [], [], [], []
+    tgt_pts = star_points.get(target_id, [])
+    if not tgt_pts:
+        return np.empty((0,)), np.empty((0, 0)), [], []
 
-    tgt_times = [t for (t, _m, _s) in t_pts]
-    T = len(tgt_times)
-    min_needed = max(_MIN_POINTS_ABS, int(math.ceil(_MIN_OVERLAP_FRAC * T)))
+    T = [t for (t, _m, _s) in tgt_pts]
+    Tset = set(T)
+    y = np.array([m for (_t, m, _s) in tgt_pts], dtype=float)
+    if y.size == 0:
+        return np.empty((0,)), np.empty((0, 0)), [], []
 
-    # Candidate list: all other stars with sufficient overlap on target epochs
-    candidates: List[int] = []
-    series: List[np.ndarray] = []
-    for sid, pts in star_to_points.items():
+    cids: List[int] = []
+    rows: List[np.ndarray] = []
+
+    for sid, pts in star_points.items():
         if sid == target_id:
             continue
-        vec = _align_to_target_times(tgt_times, pts)
-        if np.isfinite(vec).sum() >= min_needed:
-            candidates.append(int(sid))
-            series.append(vec)
+        m_by_t = {t: m for (t, m, _s) in pts}
+        if not allow_missing:
+            if not Tset.issubset(set(star_times.get(sid, []))):
+                continue
+            row = np.array([m_by_t[t] for t in T], dtype=float)
+            if np.all(np.isfinite(row)):
+                cids.append(int(sid))
+                rows.append(row)
+        else:
+            row = np.array([m_by_t.get(t, np.nan) for t in T], dtype=float)
+            if np.isfinite(row).sum() >= 2:
+                cids.append(int(sid))
+                rows.append(row)
 
-    if not candidates:
-        return [], [], [], tgt_times
+    if not rows:
+        return y, np.empty((0, len(T))), [], T
+    M = np.vstack(rows)  # [C, T]
+    return y, M, cids, T
 
-    M = np.stack(series, axis=1)  # (T, C)
-    C = M.shape[1]
-    sig_fn = _sigma_fn(robust)
 
-    # Preliminary reduction: keep best by raw (robust/std) scatter to lighten the matrix
-    prelim = np.array([sig_fn(M[:, j]) for j in range(C)], dtype=float)
-    order = np.argsort(prelim)  # small scatter first
-    topk = min(max_cmp * 3, C) if max_cmp > 0 else C
-    cols = order[:topk]
-    M = M[:, cols]
-    candidates = [candidates[j] for j in cols]
+def _iterative_trim_and_weight(
+    M: np.ndarray,
+    robust: bool,
+    worst_fraction: float,
+    max_cmp: int,
+    want_trace: bool = False,
+    lemon_compat: bool = False,
+):
+    """
+    Iteratively drop worst fraction by σ (residuals to ensemble baseline)
+    until ≤ max_cmp.
+      baseline: median (default) or mean (LEMON compat)
+      NaN handling: ignore NaNs in compat mode
+    """
+    trace: List[dict] = []
 
-    # Iterative pruning by residual scatter using leave-one-out ensemble
-    cur = list(range(M.shape[1]))
-    for _ in range(_MAX_ITER):
-        if len(cur) <= max(3, min(5, max_cmp)):  # don't over-shrink
+    if M.size == 0:
+        return np.empty((0,), dtype=int), np.empty((0,)), np.empty((0,)), trace
+
+    C0 = M.shape[0]
+    keep = np.arange(C0, dtype=int)
+
+    wf = float(worst_fraction)
+    wf = min(1.0, max(0.0, wf))
+    drop_at_least = 1 if wf > 0.0 else 0
+    step = 0
+
+    def baseline(A: np.ndarray) -> np.ndarray:
+        if not lemon_compat:
+            return np.median(A, axis=0)
+        return np.nanmean(A, axis=0)
+
+    def sigma_row(row: np.ndarray, E: np.ndarray) -> float:
+        if not lemon_compat:
+            return _sigma(row - E, robust=robust)
+        res = row - E
+        res = res[np.isfinite(res)]
+        if res.size < 2:
+            return float("inf")
+        return _mad_sigma(res) if robust else _std_sigma(res)
+
+    while keep.size > max(1, int(max_cmp)):
+        E = baseline(M[keep, :])
+        sig_full = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
+
+        n_drop = int(math.ceil(keep.size * wf))
+        n_drop = max(drop_at_least, n_drop)
+        if keep.size - n_drop < 1:
+            n_drop = keep.size - 1
+
+        order = np.argsort(sig_full)
+        keep_sorted = keep[order]
+        drop = keep_sorted[-n_drop:]
+        keep = keep_sorted[:-n_drop]
+
+        if want_trace:
+            trace.append({
+                "step": step,
+                "kept_ids": keep.tolist(),
+                "dropped_ids": drop.tolist(),
+                "sigmas_kept": [float(s) for s in sig_full[order[:-n_drop]]],
+                "sigmas_dropped": [float(s) for s in sig_full[order[-n_drop:]]],
+            })
+        step += 1
+        if keep.size <= int(max_cmp):
             break
-        # residual sigmas
-        rsig = []
-        for j in range(len(cur)):
-            a = _loo_ensemble_median(M[:, cur], j)
-            resid = M[:, cur[j]] - a
-            rsig.append(sig_fn(resid))
-        rsig = np.asarray(rsig, dtype=float)
-        # drop worst fraction
-        keep_n = max(3, int(round((1.0 - _DROP_FRAC) * len(cur))))
-        keep_idx = np.argsort(rsig)[:keep_n]
-        new_cur = [cur[k] for k in keep_idx]
-        if len(new_cur) == len(cur):
-            break
-        cur = new_cur
 
-    # Final sigma + 1/sigma^2 weights
-    final_sig = []
-    for j in range(len(cur)):
-        a = _loo_ensemble_median(M[:, cur], j)
-        resid = M[:, cur[j]] - a
-        final_sig.append(sig_fn(resid))
-    final_sig = np.asarray(final_sig, dtype=float)
+    E = baseline(M[keep, :])
+    sig_final = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
+    w = np.array([_invvar_weight(sd) for sd in sig_final], dtype=float)
+    wsum = float(np.nansum(w))
+    if wsum > 0:
+        w /= wsum
 
-    invvar = 1.0 / np.maximum(final_sig ** 2, 1e-12)
-    w = invvar / float(np.nansum(invvar)) if np.isfinite(invvar).any() else invvar
+    if want_trace:
+        trace.append({
+            "step": step,
+            "final_keep": keep.tolist(),
+            "final_sigmas": [float(s) for s in sig_final],
+            "final_weights": [float(x) for x in w],
+        })
 
-    # Cap to max_cmp if still larger; renormalize
-    if max_cmp > 0 and len(cur) > max_cmp:
-        order2 = np.argsort(final_sig)[:max_cmp]  # best sigmas
-        cur = [cur[k] for k in order2]
-        w = w[order2]
-        final_sig = final_sig[order2]
-        s = float(np.sum(w))
-        if s > 0:
-            w = w / s
+    return keep, sig_final, w, trace
 
-    cstar_ids = [candidates[j] for j in cur]
-    weights = [float(x) for x in w.tolist()]
-    sigmas  = [float(x) for x in final_sig.tolist()]
-    return cstar_ids, weights, sigmas, tgt_times
-
-# ------------------------------------------------------------------------------
-# Differential photometry core (per-target)
-# ------------------------------------------------------------------------------
 
 def _build_one_curve(
     target_id: int,
     pfilter: str,
-    star_to_points: Dict[int, List[Tuple[float, float, float]]],
-    *,
-    max_cmp: int,
+    star_points: Dict[int, List[Tuple[float, float, float]]],
+    star_times: Dict[int, List[float]],
     min_cmp: int,
     robust: bool,
-) -> Tuple[int, dict]:
-    """Return (target_id, {'cstars','cweights','cstdevs','points'})"""
-
-    cstars, cweights, cstdevs, tgt_times = _compute_cmp_weights_for_target(
-        target_id, star_to_points, robust=robust, max_cmp=max_cmp
+    worst_fraction: float,
+    max_cmp: int,
+    debug_star: int | None = None,
+    lemon_compat: bool = False,
+):
+    """
+    Returns (target_id, payload) where payload has:
+      'cstars'   : List[int]
+      'cweights' : List[float]
+      'cstdevs'  : List[float]
+      'points'   : List[(t, diff_mag, snr)]
+      'debug'    : dict (only for debug_star)
+    """
+    y, M, cids, T = _matrix_for_target(
+        target_id, star_points, star_times, allow_missing=lemon_compat
     )
+    if y.size == 0 or M.size == 0 or len(cids) == 0:
+        payload = {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
+        if debug_star is not None and int(target_id) == int(debug_star):
+            payload["debug"] = {
+                "filter": pfilter, "target": int(target_id),
+                "epochs": len(T), "candidates": [],
+                "note": "no usable candidate matrix",
+            }
+        return int(target_id), payload
 
-    if not cstars or not tgt_times:
-        return int(target_id), {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
+    want_trace = (debug_star is not None and int(target_id) == int(debug_star))
+    keep_idx, sigmas, weights, trace = _iterative_trim_and_weight(
+        M, robust=robust, worst_fraction=worst_fraction, max_cmp=int(max_cmp),
+        want_trace=want_trace, lemon_compat=lemon_compat
+    )
+    if keep_idx.size == 0:
+        payload = {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
+        if want_trace:
+            payload["debug"] = {
+                "filter": pfilter, "target": int(target_id),
+                "epochs": len(T), "candidates": cids, "trace": trace,
+                "note": "kept set empty after trimming",
+            }
+        return int(target_id), payload
 
-    # Maps for fast lookup
-    tgt_map = {t: (m, s) for (t, m, s) in star_to_points.get(target_id, [])}
-    cmp_maps = {sid: {t: (m, s) for (t, m, s) in star_to_points.get(sid, [])} for sid in cstars}
+    sel_ids = [cids[i] for i in keep_idx.tolist()]
+    sel_w   = weights.astype(float).tolist()
+    sel_sd  = sigmas.astype(float).tolist()
 
-    # Build points using per-target weights; re-normalize among comps present at each t
-    w_arr = np.asarray(cweights, dtype=float)
+    # Weighted differential curve
+    Msel = M[keep_idx, :]  # [C, T]
     points: List[Tuple[float, float, float]] = []
+    tgt_snr = [s for (_t, _m, s) in star_points.get(target_id, [])]
 
-    for t in tgt_times:
-        tgt = tgt_map.get(t)
-        if tgt is None:
-            continue
-        tgt_mag, tgt_snr = tgt
+    if not lemon_compat:
+        if Msel.shape[0] >= int(min_cmp):
+            cmp_mean = np.dot(weights, Msel)  # [T]
+            diff = y - cmp_mean
+            for j, t in enumerate(T):
+                snr = tgt_snr[j] if j < len(tgt_snr) else None
+                points.append((float(t), float(diff[j]), (None if snr is None else float(snr))))
+    else:
+        # per-epoch available comps; renormalize weights on the fly
+        C = Msel.shape[0]
+        if C >= int(min_cmp):
+            for j, t in enumerate(T):
+                col = Msel[:, j]  # [C]
+                mask = np.isfinite(col)
+                if mask.sum() < int(min_cmp):
+                    continue
+                subw = weights[mask]
+                wsum = float(subw.sum())
+                if wsum <= 0:
+                    continue
+                subw = subw / wsum
+                cmp_mean_t = float(np.dot(subw, col[mask]))
+                diff_mag = float(y[j] - cmp_mean_t)
+                snr = tgt_snr[j] if j < len(tgt_snr) else None
+                points.append((float(t), diff_mag, (None if snr is None else float(snr))))
 
-        mags, ww = [], []
-        for sid, w in zip(cstars, w_arr):
-            m = cmp_maps.get(sid, {}).get(t)
-            if m is None:
-                continue
-            mags.append(m[0]); ww.append(float(w))
-
-        if len(mags) < int(min_cmp):
-            continue
-        wsum = sum(ww)
-        if wsum <= 0:
-            continue
-        wnorm = [w / wsum for w in ww]
-        cmp_mean = float(np.dot(wnorm, np.asarray(mags, dtype=float)))
-        diff_mag = float(tgt_mag - cmp_mean)
-        points.append((float(t), diff_mag, float(tgt_snr) if tgt_snr is not None else None))
-
-    return int(target_id), {
-        "cstars": cstars,
-        "cweights": [float(w) for w in w_arr.tolist()],
-        "cstdevs": cstdevs,
+    payload = {
+        "cstars": sel_ids,
+        "cweights": sel_w,
+        "cstdevs": sel_sd,
         "points": points,
     }
 
-# ------------------------------------------------------------------------------
-# Compatibility layer: create photometry VIEW (or TABLE) from light_curves
-# ------------------------------------------------------------------------------
+    if want_trace:
+        # initial σ per candidate against median/mean of ALL candidates
+        if lemon_compat:
+            E0 = np.nanmean(M, axis=0)
+        else:
+            E0 = np.median(M, axis=0)
+        sig0 = [float(_sigma((M[i, :] - E0)[np.isfinite(M[i, :] - E0)] if lemon_compat else (M[i, :] - E0),
+                             robust=robust))
+                for i in range(M.shape[0])]
+        payload["debug"] = {
+            "filter": pfilter,
+            "target": int(target_id),
+            "epochs": len(T),
+            "n_candidates": len(cids),
+            "candidates": [{"id": int(cid), "sigma0": float(sig0[i])} for i, cid in enumerate(cids)],
+            "trace": trace,
+            "final": {
+                "cstars": sel_ids,
+                "sigmas": sel_sd,
+                "weights": sel_w,
+                "sum_weights": float(sum(sel_w)),
+            },
+        }
 
+    return int(target_id), payload
+
+
+# ---------------- photometry VIEW/TABLE compat ----------------
 def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
     with eng.connect() as con:
         v = con.execute(text("SELECT sqlite_version()")).scalar_one()
@@ -520,48 +677,36 @@ def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
     return tuple(parts[:3])  # type: ignore[return-value]
 
 def _ensure_photometry_compat(out_eng) -> None:
-    """
-    If `photometry` doesn't exist but `light_curves` does, create a
-    compatibility layer so code that expects `photometry` keeps working.
-
-    Preference:
-      1) Create a VIEW `photometry` selecting from `light_curves` with a ROW_NUMBER() id
-         (requires SQLite >= 3.25).
-      2) Else materialize a TABLE `photometry` and bulk-copy from `light_curves`.
-    """
     with out_eng.connect() as con:
-        has_photometry = bool(con.execute(
-            text("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='photometry'")
-        ).fetchone())
-        has_light_curves = bool(con.execute(
-            text("SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name='light_curves'")
-        ).fetchone())
+        has_photometry = bool(con.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='photometry' LIMIT 1"
+        )).fetchone())
+        has_lc = bool(con.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='light_curves' LIMIT 1"
+        )).fetchone())
 
-    if has_photometry or not has_light_curves:
-        return  # nothing to do
+    if has_photometry or not has_lc:
+        return
 
     major, minor, patch = _sqlite_version_tuple(out_eng)
-    can_row_number = (major, minor, patch) >= (3, 25, 0)
-
+    can_rownum = (major, minor, patch) >= (3, 25, 0)
     try:
         with out_eng.begin() as con:
-            if can_row_number:
-                # Create a compatibility VIEW with an id
+            if can_rownum:
                 con.execute(text("DROP VIEW IF EXISTS photometry"))
                 con.execute(text(
                     """
                     CREATE VIEW photometry AS
                     SELECT
-                        ROW_NUMBER() OVER ()            AS id,
-                        lc.star_id                      AS star_id,
-                        lc.image_id                     AS image_id,
-                        lc.magnitude                    AS magnitude,
-                        COALESCE(lc.snr, 0.0)           AS snr
+                        ROW_NUMBER() OVER ()  AS id,
+                        lc.star_id             AS star_id,
+                        lc.image_id            AS image_id,
+                        lc.magnitude           AS magnitude,
+                        COALESCE(lc.snr, 0.0)  AS snr
                     FROM light_curves lc
                     """
                 ))
             else:
-                # Materialize a real table with sane schema and indexes
                 con.execute(text(
                     """
                     CREATE TABLE IF NOT EXISTS photometry (
@@ -574,7 +719,6 @@ def _ensure_photometry_compat(out_eng) -> None:
                     )
                     """
                 ))
-                # Populate from light_curves
                 con.execute(text(
                     """
                     INSERT OR IGNORE INTO photometry (star_id, image_id, magnitude, snr)
@@ -582,18 +726,59 @@ def _ensure_photometry_compat(out_eng) -> None:
                     FROM light_curves lc
                     """
                 ))
-                # Indexes for common lookups
                 con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_star_image ON photometry(star_id, image_id)"))
                 con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_image ON photometry(image_id)"))
     except Exception as e:
-        # Non-fatal: leave DB as-is; downstream tools can read light_curves directly
         logging.warning("Failed to create photometry compatibility layer: %s", e)
 
-# ------------------------------------------------------------------------------
-# main
-# ------------------------------------------------------------------------------
 
-def main(argv=None):
+# ---------------- debug output ----------------
+def _fmtf(x: float, n: int = 6) -> str:
+    try:
+        return f"{float(x):.{n}f}"
+    except Exception:
+        return str(x)
+
+def _print_debug_report(pf: str, dbg: dict, progress: _Progress | None = None) -> None:
+    pre = style.prefix
+    def out(line: str):
+        if progress:
+            progress.print_above(line)
+        else:
+            print(line)
+
+    out(pre)
+    out(f"{pre}DEBUG — filter={pf}  target={dbg.get('target')}  epochs={dbg.get('epochs')}")
+    out(f"{pre}  n_candidates: {dbg.get('n_candidates', 0)}")
+    cands = dbg.get("candidates") or []
+    if cands:
+        out(f"{pre}  initial candidates (id, sigma0):")
+        for c in cands[:15]:
+            out(f"{pre}    {c['id']:>6d}   σ0={_fmtf(c['sigma0'], 6)}")
+        if len(cands) > 15:
+            out(f"{pre}    ... ({len(cands)-15} more)")
+    trace = dbg.get("trace") or []
+    for step in trace:
+        if "final_keep" in step:
+            break
+        kept = step.get("kept_ids", [])
+        dropped = step.get("dropped_ids", [])
+        out(f"{pre}  step {step.get('step')}: kept={len(kept)} dropped={len(dropped)}")
+        if dropped:
+            ds = ", ".join(str(i) for i in dropped[:10])
+            out(f"{pre}    dropped indices: {ds}{' ...' if len(dropped)>10 else ''}")
+    final = dbg.get("final") or {}
+    f_ids = final.get("cstars") or []
+    f_sd  = final.get("sigmas") or []
+    f_w   = final.get("weights") or []
+    out(f"{pre}  FINAL ({len(f_ids)} stars):")
+    for sid, sd, w in zip(f_ids, f_sd, f_w):
+        out(f"{pre}    cstar={sid:>6d}   σ={_fmtf(sd,6)}   w={_fmtf(w,6)}")
+    out(f"{pre}  sum(weights) = {_fmtf(final.get('sum_weights', 0.0), 6)}")
+
+
+# ---------------- main ----------------
+def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     opts = parser.parse_args(argv)
@@ -609,7 +794,6 @@ def main(argv=None):
     in_path = Path(opts.input_db)
     out_path = Path(opts.output_db)
 
-    # Overwrite
     if out_path.exists() and opts.overwrite:
         try:
             out_path.unlink()
@@ -619,7 +803,7 @@ def main(argv=None):
     in_eng = _engine_for(in_path)
     out_eng = _engine_for(out_path)
 
-    # Make sure the output DB has the required tables
+    # Ensure schema in output
     _ensure_schema(out_eng)
 
     # Copy stars & images first
@@ -628,88 +812,94 @@ def main(argv=None):
     _copy_stars_images(in_eng, out_eng)
     print("done.")
 
-    # Determine filters
+    # Filters to process
     filters = _list_filters(in_eng)
     if opts.filters:
         want = set(map(str, opts.filters))
         filters = [pf for pf in filters if pf in want]
     if not filters:
         print(f"{style.prefix}Error. No matching photometric filters found to process.")
-        print(style.error_exit_message)
+        print(getattr(style, "error_exit_message", ""))
         return 1
 
-    # Per-filter processing
+    dbg_star = opts.debug_star
+    dbg_filter = (opts.debug_filter.strip() if isinstance(opts.debug_filter, str) and opts.debug_filter else None)
+
+    # Decide progress visibility
+    auto_tty = sys.stdout.isatty()
+    show_progress = (opts.progress or (auto_tty and not opts.no_progress))
+
     for pf in sorted(filters):
         print(style.prefix)
         print(f"{style.prefix}Processing filter {pf} ...")
 
-        _times_all, star_to_points = _collect_filter_data(in_eng, pf, min_snr=float(opts.min_snr))
-        nstars = len(star_to_points)
+        star_points, star_times = _collect_filter_data(in_eng, pf, min_snr=float(opts.min_snr))
+        nstars = len(star_points)
         print(f"{style.prefix}{nstars} stars with usable photometry.")
         if nstars == 0:
             continue
 
-        # Parallel curve computation (compute only; all DB I/O is serialized)
-        work_ids = sorted(star_to_points.keys())
-        workers = max(1, getattr(defaults, "ncores", multiprocessing.cpu_count()))
+        targets = sorted(star_points.keys())
+        workers = max(1, int(opts.cores))
         print(f"{style.prefix}Building differential light curves in parallel ({workers} workers).")
+
+        progress = _Progress(total=len(targets), label=f"{style.prefix} progress", enabled=show_progress)
+
         results: List[Tuple[int, dict]] = []
-        with cf.ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [
                 ex.submit(
                     _build_one_curve,
-                    sid, pf, star_to_points,
-                    max_cmp=int(opts.max_cmp),
-                    min_cmp=int(opts.min_cmp),
-                    robust=bool(opts.robust),
+                    sid, pf, star_points, star_times,
+                    int(opts.min_cmp), bool(opts.robust),
+                    float(opts.worst_fraction), int(opts.max_cmp),
+                    dbg_star,
+                    bool(opts.lemon_compat)
                 )
-                for sid in work_ids
+                for sid in targets
             ]
-            for i, fut in enumerate(cf.as_completed(futs), 1):
+            for fut in cf.as_completed(futs):
                 try:
                     results.append(fut.result())
                 except Exception as e:
                     logging.debug("curve worker failed for a star: %s", e)
-                if level <= logging.INFO and (i % max(1, len(work_ids)//10) == 0):
-                    print(f"{style.prefix}  . {i}/{len(work_ids)}", flush=True)
+                progress.update(1)
+        progress.finish()
 
-        # Serialize DB writes (avoid locks)
+        # Serialize writes to avoid SQLite contention
         print(f"{style.prefix}Saving light curves to the database...")
 
+        debug_payload: dict | None = None
         with out_eng.begin() as con:
-            # ensure filter id exists in output DB
-            con.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"), {"n": str(pf)})
-            f_id = con.execute(text("SELECT id FROM photometric_filters WHERE name=:n"), {"n": str(pf)}).scalar_one()
+            # Filter id in the output DB
+            con.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
+                        {"n": str(pf)})
+            f_id = con.execute(text(
+                "SELECT id FROM photometric_filters WHERE name=:n"
+            ), {"n": str(pf)}).scalar_one()
 
-            # cmp_stars: for each star, replace its set for this filter
-            by_star = {}
+            # cmp_stars: replace per target/filter
             for sid, payload in results:
-                if not payload["cstars"]:
-                    continue
-                # Defensive: single normalization per (star, filter)
-                wsum = sum(payload["cweights"])
-                if wsum > 0:
-                    norm_w = [w / wsum for w in payload["cweights"]]
-                else:
-                    norm_w = payload["cweights"]
+                if dbg_star is not None and int(sid) == int(dbg_star):
+                    if dbg_filter is None or str(dbg_filter) == str(pf):
+                        debug_payload = payload.get("debug")
 
-                rows = []
-                for c, w, sd in zip(payload["cstars"], norm_w, payload["cstdevs"]):
-                    rows.append({"star_id": int(sid), "filter_id": int(f_id),
-                                 "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
-                by_star[int(sid)] = rows
-
-            for sid, rows in by_star.items():
-                con.execute(text("DELETE FROM cmp_stars WHERE star_id=:sid AND filter_id=:fid"),
-                            {"sid": int(sid), "fid": int(f_id)})
-                if rows:
+                if payload.get("cstars"):
+                    rows = []
+                    for c, w, sd in zip(payload["cstars"], payload["cweights"], payload["cstdevs"]):
+                        rows.append({"star_id": int(sid), "filter_id": int(f_id),
+                                     "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
                     con.execute(text(
-                        "INSERT INTO cmp_stars (star_id, filter_id, cstar_id, stdev, weight) "
-                        "VALUES (:star_id, :filter_id, :cstar_id, :stdev, :weight)"
-                    ), rows)
+                        "DELETE FROM cmp_stars WHERE star_id=:sid AND filter_id=:fid"
+                    ), {"sid": int(sid), "fid": int(f_id)})
+                    if rows:
+                        con.execute(text(
+                            "INSERT INTO cmp_stars (star_id, filter_id, cstar_id, stdev, weight) "
+                            "VALUES (:star_id, :filter_id, :cstar_id, :stdev, :weight)"
+                        ), rows)
 
-            # light_curves: upsert by (star_id, image_id)
-            lc_rows = []
+            # light_curves upsert
+            lc_rows: List[dict] = []
             for sid, payload in results:
                 pts = payload["points"]
                 if not pts:
@@ -721,16 +911,24 @@ def main(argv=None):
                     lc_rows.append({"star_id": int(sid), "image_id": int(iid),
                                     "magnitude": float(dm),
                                     "snr": None if snr is None else float(snr)})
-
             if lc_rows:
                 con.execute(text(
                     "INSERT OR REPLACE INTO light_curves (star_id, image_id, magnitude, snr) "
                     "VALUES (:star_id, :image_id, :magnitude, :snr)"
                 ), lc_rows)
 
-        print(f"{style.prefix}{len({sid for sid, p in results if p['points']})} curves written for filter {pf}.")
+        n_written = sum(1 for _sid, p in results if p["points"])
+        print(f"{style.prefix}{n_written} curves written for filter {pf}.")
 
-    # Metadata & analyze (best-effort)
+        # Debug report (after writes)
+        if dbg_star is not None and (dbg_filter is None or str(dbg_filter) == str(pf)):
+            if debug_payload:
+                _print_debug_report(pf, debug_payload)
+            else:
+                print(f"{style.prefix}DEBUG — star {dbg_star} has no trace for filter {pf} "
+                      f"(no points or no candidates).")
+
+    # metadata (best-effort)
     try:
         with out_eng.begin() as con:
             con.execute(text(
@@ -738,7 +936,10 @@ def main(argv=None):
             ), [{"k": "date", "v": float(time.time())},
                 {"k": "author", "v": os.getenv("USER") or os.getenv("USERNAME") or ""},
                 {"k": "hostname", "v": socket.gethostname()}])
-            rows = con.execute(text("SELECT value FROM metadata WHERE key in ('date','author','hostname') ORDER BY key")).all()
+
+            rows = con.execute(text(
+                "SELECT value FROM metadata WHERE key in ('date','author','hostname') ORDER BY key"
+            )).all()
             md5 = hashlib.md5()
             for (v,) in rows:
                 md5.update(str(v).encode("utf-8"))
@@ -748,10 +949,10 @@ def main(argv=None):
     except Exception:
         pass
 
-    # Create compatibility photometry view/table
+    # photometry compat
     _ensure_photometry_compat(out_eng)
 
-    # ANALYZE to refresh stats
+    # ANALYZE
     print(f"{style.prefix}Analyzing database statistics...", end="")
     sys.stdout.flush()
     try:
