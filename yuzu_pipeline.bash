@@ -201,7 +201,7 @@ delete_temp_files() {
                "${OUTPUT_DIR}/stacked_area.fits" \
             ; do
     if [ -f "$file" ]; then
-        rm "$file"
+        rm -f "$file"
         echo "Deleted $file"
     else
         echo "$file does not exist"
