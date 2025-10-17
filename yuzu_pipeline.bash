@@ -25,8 +25,8 @@ OBJECT_POS='00 38 17.56 +42 27 47.2'
 YUZU_CONFIGURATION="/mnt/uxmal_groups/common_data/apps/py_yuzu/conf_manager/matilde_conf.txt"
 #-----------------------------
 # External tooling locations
-ASTROMETRY_DIR="/mnt/uxmal_groups/common_data/apps/m2/input/astrometry.net"
-WCS_SOLVER_SCRIPT="./wcs_classic_parallel_solve_fits.bash"
+ASTROMETRY_DIR="/mnt/uxmal_groups/common_data/apps/m2/input/astrometry.net/"
+WCS_SOLVER_SCRIPT="./solve_astrometry.bash"
 #-----------------------------
 YUZU_DIR="/mnt/uxmal_groups/common_data/apps/py_yuzu"
 YUZU_BIN="./yuzu"
@@ -162,6 +162,14 @@ gather_wcs_fits() {
   log "Found ${#FITS_FILES[@]} WCS-solved FITS."
 }
 #-----------------------------
+# Ensure FITS keyword GAIN
+#-----------------------------
+ensure_gain_fits_keyword() {
+  log "Ensuring FITS keyword GAIN is present in .fits files..."
+  ./add_gain_fits_keyword.bash ${INPUT_IMAGE_WCS_SOLVED_DIR}"
+  log "Ensured FITS keyword GAIN is present in .fits files."
+}
+#-----------------------------
 # Yuzu steps
 #-----------------------------
 run_mosaic() {
@@ -223,6 +231,7 @@ main() {
   prepare_dirs
   run_wcs_solver
   gather_wcs_fits
+  ensure_gain_fits_keyword
   run_mosaic
   run_photometry
   run_diffphot
