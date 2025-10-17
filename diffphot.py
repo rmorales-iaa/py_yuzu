@@ -2,22 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-diffphot.py — Differential photometry (LEMON/Broeg-style) with SQLAlchemy Core.
+diffphot.py ? Differential photometry (LEMON/Broeg-style) with SQLAlchemy Core.
 
 Features:
-  • Per-filter differential photometry using an artificial comparison star.
-  • Optional LEMON-compat behavior:
+  ? Per-filter differential photometry using an artificial comparison star.
+  ? Optional LEMON-compat behavior:
       - mean baseline (instead of median),
       - allow missing comparison measurements,
       - per-epoch weight re-normalization.
-  • Comparison set trimming by worst-fraction of residual scatter, iteratively.
-  • Writes: stars, images, cmp_stars, light_curves, and a compat photometry VIEW/TABLE.
-  • Debug tracer: --debug-star (and optional --debug-filter).
-  • NEW: Console progress bar for the parallel curve build (auto-enabled on TTY).
+  ? Comparison set trimming by worst-fraction of residual scatter, iteratively.
+  ? Writes: stars, images, cmp_stars, light_curves, and a compat photometry VIEW/TABLE.
+  ? Debug tracer: --debug-star (and optional --debug-filter).
+  ? Console progress bar for the parallel curve build (auto-enabled on TTY).
+  ? FULLY PARALLELIZED differential photometry computation.
+  ? Comprehensive progress tracking and statistics.
 
 CLI examples:
   yuzu diffphot in.db out.db
   yuzu diffphot in.db out.db --lemon-compat --debug-star 145 --debug-filter R -v
+  yuzu diffphot in.db out.db --cores 8 --progress -vv
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ import socket
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from sqlalchemy import create_engine, text
@@ -42,7 +45,7 @@ from sqlalchemy import create_engine, text
 # ---------------- style/default fallbacks ----------------
 try:
     import style  # type: ignore
-except Exception:
+except (ImportError, ModuleNotFoundError):
     class _Style:
         prefix = ">> "
         logging_format = "%(message)s"
@@ -51,7 +54,7 @@ except Exception:
 
 try:
     import defaults  # type: ignore
-except Exception:
+except (ImportError, ModuleNotFoundError):
     class _Defaults:
         ncores = multiprocessing.cpu_count()
         verbosity = 0
@@ -133,7 +136,7 @@ class _Progress:
     def _term_width(self) -> int:
         try:
             return shutil.get_terminal_size(fallback=(80, 24)).columns
-        except Exception:
+        except (OSError, AttributeError):
             return 80
 
     def _render_line(self) -> str:
@@ -152,8 +155,11 @@ class _Progress:
             return
         self.count = min(self.total, self.count + int(step))
         line = self._render_line()
-        sys.stdout.write("\r" + line)
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+        except (OSError, UnicodeEncodeError):
+            pass  # Silently ignore encoding issues on some terminals
         self._last_render = line
 
     def finish(self) -> None:
@@ -161,16 +167,22 @@ class _Progress:
             return
         self.count = self.total
         line = self._render_line()
-        sys.stdout.write("\r" + line + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\r" + line + "\n")
+            sys.stdout.flush()
+        except (OSError, UnicodeEncodeError):
+            pass
         self._last_render = ""
 
     def clear_line(self) -> None:
         if not self.enabled:
             return
         width = self._term_width()
-        sys.stdout.write("\r" + " " * width + "\r")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\r" + " " * width + "\r")
+            sys.stdout.flush()
+        except (OSError, UnicodeEncodeError):
+            pass
         self._last_render = ""
 
     def print_above(self, text: str) -> None:
@@ -181,8 +193,11 @@ class _Progress:
         print(text)
         # redraw current bar
         if self.count < self.total:
-            sys.stdout.write("\r" + self._render_line())
-            sys.stdout.flush()
+            try:
+                sys.stdout.write("\r" + self._render_line())
+                sys.stdout.flush()
+            except (OSError, UnicodeEncodeError):
+                pass
 
 
 # ---------------- math helpers ----------------
@@ -211,7 +226,8 @@ def _invvar_weight(sd: float) -> float:
 
 # ---------------- DB helpers ----------------
 def _engine_for(path: Path):
-    return create_engine(f"sqlite+pysqlite:///{path}", future=True)
+    path_obj = Path(path) if not isinstance(path, Path) else path
+    return create_engine(f"sqlite+pysqlite:///{path_obj}", future=True)
 
 def _ensure_schema(eng) -> None:
     ddl = [
@@ -286,85 +302,98 @@ def _ensure_schema(eng) -> None:
         );
         """,
     ]
-    with eng.begin() as con:
-        for stmt in ddl:
-            con.execute(text(stmt))
+    try:
+        with eng.begin() as con:
+            for stmt in ddl:
+                con.execute(text(stmt))
+    except Exception as e:
+        logging.error(f"Failed to create database schema: {e}")
+        raise
 
 def _list_filters(eng) -> List[str]:
-    with eng.connect() as con:
-        rows = con.execute(text("SELECT name FROM photometric_filters")).all()
-    return sorted({str(r[0]) for r in rows if r[0] is not None})
+    try:
+        with eng.connect() as con:
+            rows = con.execute(text("SELECT name FROM photometric_filters")).all()
+        return sorted({str(r[0]) for r in rows if r[0] is not None})
+    except Exception as e:
+        logging.error(f"Failed to list filters: {e}")
+        return []
 
 def _copy_stars_images(in_eng, out_eng) -> None:
-    # Stars
-    with in_eng.connect() as cin:
-        stars = cin.execute(text(
-            "SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag FROM stars ORDER BY id"
-        )).all()
-    with out_eng.begin() as cout:
-        if stars:
-            cout.execute(
-                text(
-                    "INSERT OR REPLACE INTO stars "
-                    "(id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag) "
-                    "VALUES (:id, :x, :y, :ra, :dec, :epoch, :pm_ra, :pm_dec, :imag)"
-                ),
-                [
-                    dict(
-                        id=int(sid),
-                        x=float(x), y=float(y), ra=float(ra), dec=float(dec),
-                        epoch=float(epoch),
-                        pm_ra=None if pm_ra is None else float(pm_ra),
-                        pm_dec=None if pm_dec is None else float(pm_dec),
-                        imag=float(imag),
-                    )
-                    for sid, x, y, ra, dec, epoch, pm_ra, pm_dec, imag in stars
-                ],
-            )
+    try:
+        # Stars
+        with in_eng.connect() as cin:
+            stars = cin.execute(text(
+                "SELECT id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag FROM stars ORDER BY id"
+            )).all()
 
-    # Images
-    with in_eng.connect() as cin:
-        imgs = cin.execute(text(
-            "SELECT i.path, f.name, i.unix_time, i.object, i.airmass, i.gain, "
-            "       i.ra, i.dec, i.sources "
-            "FROM images AS i "
-            "LEFT JOIN photometric_filters AS f ON f.id = i.filter_id "
-            "ORDER BY f.name ASC, i.unix_time ASC"
-        )).all()
+        with out_eng.begin() as cout:
+            if stars:
+                cout.execute(
+                    text(
+                        "INSERT OR REPLACE INTO stars "
+                        "(id, x, y, ra, dec, epoch, pm_ra, pm_dec, imag) "
+                        "VALUES (:id, :x, :y, :ra, :dec, :epoch, :pm_ra, :pm_dec, :imag)"
+                    ),
+                    [
+                        dict(
+                            id=int(sid),
+                            x=float(x), y=float(y), ra=float(ra), dec=float(dec),
+                            epoch=float(epoch),
+                            pm_ra=None if pm_ra is None else float(pm_ra),
+                            pm_dec=None if pm_dec is None else float(pm_dec),
+                            imag=float(imag),
+                        )
+                        for sid, x, y, ra, dec, epoch, pm_ra, pm_dec, imag in stars
+                    ],
+                )
 
-    with out_eng.begin() as cout:
-        # Ensure filters exist
-        fltnames = sorted({str(fname) for _p, fname, *_rest in imgs if fname is not None})
-        for fn in fltnames:
-            cout.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
-                         {"n": str(fn)})
+        # Images
+        with in_eng.connect() as cin:
+            imgs = cin.execute(text(
+                "SELECT i.path, f.name, i.unix_time, i.object, i.airmass, i.gain, "
+                "       i.ra, i.dec, i.sources "
+                "FROM images AS i "
+                "LEFT JOIN photometric_filters AS f ON f.id = i.filter_id "
+                "ORDER BY f.name ASC, i.unix_time ASC"
+            )).all()
 
-        # Map names to ids
-        fids = {r[0]: r[1] for r in cout.execute(text(
-            "SELECT name, id FROM photometric_filters"
-        )).all()}
+        with out_eng.begin() as cout:
+            # Ensure filters exist
+            fltnames = sorted({str(fname) for _p, fname, *_rest in imgs if fname is not None})
+            for fn in fltnames:
+                cout.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
+                             {"n": str(fn)})
 
-        # Insert images
-        rows = []
-        for path, fname, t, obj, am, g, ra, dec, src in imgs:
-            if fname is None:
-                continue
-            rows.append(dict(
-                path=str(path),
-                filter_id=int(fids[str(fname)]),
-                unix_time=None if t is None else float(t),
-                object=obj,
-                airmass=None if am is None else float(am),
-                gain=None if g is None else float(g),
-                ra=float(ra), dec=float(dec),
-                sources=int(src or 0),
-            ))
-        if rows:
-            cout.execute(text(
-                "INSERT OR IGNORE INTO images "
-                "(path, filter_id, unix_time, object, airmass, gain, ra, dec, sources) "
-                "VALUES (:path, :filter_id, :unix_time, :object, :airmass, :gain, :ra, :dec, :sources)"
-            ), rows)
+            # Map names to ids
+            fids = {r[0]: r[1] for r in cout.execute(text(
+                "SELECT name, id FROM photometric_filters"
+            )).all()}
+
+            # Insert images
+            rows = []
+            for path, fname, t, obj, am, g, ra, dec, src in imgs:
+                if fname is None:
+                    continue
+                rows.append(dict(
+                    path=str(path),
+                    filter_id=int(fids[str(fname)]),
+                    unix_time=None if t is None else float(t),
+                    object=obj,
+                    airmass=None if am is None else float(am),
+                    gain=None if g is None else float(g),
+                    ra=float(ra), dec=float(dec),
+                    sources=int(src or 0),
+                ))
+            if rows:
+                cout.execute(text(
+                    "INSERT OR IGNORE INTO images "
+                    "(path, filter_id, unix_time, object, airmass, gain, ra, dec, sources) "
+                    "VALUES (:path, :filter_id, :unix_time, :object, :airmass, :gain, :ra, :dec, :sources)"
+                ), rows)
+    except Exception as e:
+        logging.error(f"Failed to copy stars and images: {e}")
+        raise
 
 def _collect_filter_data(in_eng, pfilter: str, min_snr: float
                          ) -> Tuple[Dict[int, List[Tuple[float, float, float]]],
@@ -372,41 +401,50 @@ def _collect_filter_data(in_eng, pfilter: str, min_snr: float
     """Return: (star_points, star_times)."""
     star_points: Dict[int, List[Tuple[float, float, float]]] = {}
     star_times: Dict[int, List[float]] = {}
-    with in_eng.connect() as con:
-        rows = con.execute(
-            text(
-                "SELECT p.star_id, i.unix_time, p.magnitude, p.snr "
-                "FROM photometry AS p "
-                "JOIN images AS i ON i.id = p.image_id "
-                "JOIN photometric_filters AS f ON f.id = i.filter_id "
-                "WHERE f.name = :fname "
-                "ORDER BY p.star_id ASC, i.unix_time ASC"
-            ),
-            {"fname": str(pfilter)},
-        ).all()
 
-    for sid, t, m, snr in rows:
-        if t is None or m is None or snr is None:
-            continue
-        snr = float(snr)
-        if not math.isfinite(snr) or snr < float(min_snr):
-            continue
-        star_points.setdefault(int(sid), []).append((float(t), float(m), float(snr)))
-        star_times.setdefault(int(sid), []).append(float(t))
+    try:
+        with in_eng.connect() as con:
+            rows = con.execute(
+                text(
+                    "SELECT p.star_id, i.unix_time, p.magnitude, p.snr "
+                    "FROM photometry AS p "
+                    "JOIN images AS i ON i.id = p.image_id "
+                    "JOIN photometric_filters AS f ON f.id = i.filter_id "
+                    "WHERE f.name = :fname "
+                    "ORDER BY p.star_id ASC, i.unix_time ASC"
+                ),
+                {"fname": str(pfilter)},
+            ).all()
+
+        for sid, t, m, snr in rows:
+            if t is None or m is None or snr is None:
+                continue
+            snr = float(snr)
+            if not math.isfinite(snr) or snr < float(min_snr):
+                continue
+            star_points.setdefault(int(sid), []).append((float(t), float(m), float(snr)))
+            star_times.setdefault(int(sid), []).append(float(t))
+    except Exception as e:
+        logging.error(f"Failed to collect filter data for {pfilter}: {e}")
+        raise
 
     return star_points, star_times
 
-def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> int | None:
-    with out_eng.connect() as con:
-        rid = con.execute(
-            text(
-                "SELECT i.id "
-                "FROM images AS i JOIN photometric_filters AS f ON f.id = i.filter_id "
-                "WHERE f.name = :fname AND i.unix_time = :t"
-            ),
-            {"fname": str(pfilter), "t": float(unix_time)},
-        ).scalar_one_or_none()
-    return None if rid is None else int(rid)
+def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> Optional[int]:
+    try:
+        with out_eng.connect() as con:
+            rid = con.execute(
+                text(
+                    "SELECT i.id "
+                    "FROM images AS i JOIN photometric_filters AS f ON f.id = i.filter_id "
+                    "WHERE f.name = :fname AND i.unix_time = :t"
+                ),
+                {"fname": str(pfilter), "t": float(unix_time)},
+            ).scalar_one_or_none()
+        return None if rid is None else int(rid)
+    except Exception as e:
+        logging.debug(f"Failed to resolve image ID for {pfilter} at {unix_time}: {e}")
+        return None
 
 
 # ---------------- ensemble building ----------------
@@ -469,8 +507,8 @@ def _iterative_trim_and_weight(
     lemon_compat: bool = False,
 ):
     """
-    Iteratively drop worst fraction by σ (residuals to ensemble baseline)
-    until ≤ max_cmp.
+    Iteratively drop worst fraction by ? (residuals to ensemble baseline)
+    until ? max_cmp.
       baseline: median (default) or mean (LEMON compat)
       NaN handling: ignore NaNs in compat mode
     """
@@ -554,7 +592,7 @@ def _build_one_curve(
     robust: bool,
     worst_fraction: float,
     max_cmp: int,
-    debug_star: int | None = None,
+    debug_star: Optional[int] = None,
     lemon_compat: bool = False,
 ):
     """
@@ -636,7 +674,7 @@ def _build_one_curve(
     }
 
     if want_trace:
-        # initial σ per candidate against median/mean of ALL candidates
+        # initial ? per candidate against median/mean of ALL candidates
         if lemon_compat:
             E0 = np.nanmean(M, axis=0)
         else:
@@ -664,33 +702,38 @@ def _build_one_curve(
 
 # ---------------- photometry VIEW/TABLE compat ----------------
 def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
-    with eng.connect() as con:
-        v = con.execute(text("SELECT sqlite_version()")).scalar_one()
-    parts: List[int] = []
-    for tok in str(v).split("."):
-        try:
-            parts.append(int(tok))
-        except Exception:
+    try:
+        with eng.connect() as con:
+            v = con.execute(text("SELECT sqlite_version()")).scalar_one()
+        parts: List[int] = []
+        for tok in str(v).split("."):
+            try:
+                parts.append(int(tok))
+            except (ValueError, TypeError):
+                parts.append(0)
+        while len(parts) < 3:
             parts.append(0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])  # type: ignore[return-value]
+        return (parts[0], parts[1], parts[2])
+    except Exception as e:
+        logging.warning(f"Failed to get SQLite version, assuming (3, 0, 0): {e}")
+        return (3, 0, 0)
 
 def _ensure_photometry_compat(out_eng) -> None:
-    with out_eng.connect() as con:
-        has_photometry = bool(con.execute(text(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='photometry' LIMIT 1"
-        )).fetchone())
-        has_lc = bool(con.execute(text(
-            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='light_curves' LIMIT 1"
-        )).fetchone())
-
-    if has_photometry or not has_lc:
-        return
-
-    major, minor, patch = _sqlite_version_tuple(out_eng)
-    can_rownum = (major, minor, patch) >= (3, 25, 0)
     try:
+        with out_eng.connect() as con:
+            has_photometry = bool(con.execute(text(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='photometry' LIMIT 1"
+            )).fetchone())
+            has_lc = bool(con.execute(text(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name='light_curves' LIMIT 1"
+            )).fetchone())
+
+        if has_photometry or not has_lc:
+            return
+
+        major, minor, patch = _sqlite_version_tuple(out_eng)
+        can_rownum = (major, minor, patch) >= (3, 25, 0)
+
         with out_eng.begin() as con:
             if can_rownum:
                 con.execute(text("DROP VIEW IF EXISTS photometry"))
@@ -729,17 +772,17 @@ def _ensure_photometry_compat(out_eng) -> None:
                 con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_star_image ON photometry(star_id, image_id)"))
                 con.execute(text("CREATE INDEX IF NOT EXISTS phot_by_image ON photometry(image_id)"))
     except Exception as e:
-        logging.warning("Failed to create photometry compatibility layer: %s", e)
+        logging.warning(f"Failed to create photometry compatibility layer: {e}")
 
 
 # ---------------- debug output ----------------
 def _fmtf(x: float, n: int = 6) -> str:
     try:
         return f"{float(x):.{n}f}"
-    except Exception:
+    except (ValueError, TypeError):
         return str(x)
 
-def _print_debug_report(pf: str, dbg: dict, progress: _Progress | None = None) -> None:
+def _print_debug_report(pf: str, dbg: dict, progress: Optional[_Progress] = None) -> None:
     pre = style.prefix
     def out(line: str):
         if progress:
@@ -748,13 +791,13 @@ def _print_debug_report(pf: str, dbg: dict, progress: _Progress | None = None) -
             print(line)
 
     out(pre)
-    out(f"{pre}DEBUG — filter={pf}  target={dbg.get('target')}  epochs={dbg.get('epochs')}")
+    out(f"{pre}DEBUG ? filter={pf}  target={dbg.get('target')}  epochs={dbg.get('epochs')}")
     out(f"{pre}  n_candidates: {dbg.get('n_candidates', 0)}")
     cands = dbg.get("candidates") or []
     if cands:
         out(f"{pre}  initial candidates (id, sigma0):")
         for c in cands[:15]:
-            out(f"{pre}    {c['id']:>6d}   σ0={_fmtf(c['sigma0'], 6)}")
+            out(f"{pre}    {c['id']:>6d}   ?0={_fmtf(c['sigma0'], 6)}")
         if len(cands) > 15:
             out(f"{pre}    ... ({len(cands)-15} more)")
     trace = dbg.get("trace") or []
@@ -773,12 +816,62 @@ def _print_debug_report(pf: str, dbg: dict, progress: _Progress | None = None) -
     f_w   = final.get("weights") or []
     out(f"{pre}  FINAL ({len(f_ids)} stars):")
     for sid, sd, w in zip(f_ids, f_sd, f_w):
-        out(f"{pre}    cstar={sid:>6d}   σ={_fmtf(sd,6)}   w={_fmtf(w,6)}")
+        out(f"{pre}    cstar={sid:>6d}   ?={_fmtf(sd,6)}   w={_fmtf(w,6)}")
     out(f"{pre}  sum(weights) = {_fmtf(final.get('sum_weights', 0.0), 6)}")
 
 
+# ---------------- Parallelized batch processing with progress ----------------
+def _process_filter_batch(
+    pfilter: str,
+    targets: List[int],
+    star_points: Dict[int, List[Tuple[float, float, float]]],
+    star_times: Dict[int, List[float]],
+    min_cmp: int,
+    robust: bool,
+    worst_fraction: float,
+    max_cmp: int,
+    debug_star: Optional[int],
+    lemon_compat: bool,
+) -> Tuple[List[Tuple[int, dict]], Dict[str, int]]:
+    """
+    Process a batch of target stars for a given filter.
+    Returns (results, stats) where:
+      - results: list of (target_id, payload) tuples
+      - stats: dict with 'completed', 'failed', 'candidates', 'comparisons'
+    """
+    results = []
+    stats = {'completed': 0, 'failed': 0, 'candidates': 0, 'comparisons': 0}
+
+    for target_id in targets:
+        try:
+            result = _build_one_curve(
+                target_id, pfilter, star_points, star_times,
+                min_cmp, robust, worst_fraction, max_cmp,
+                debug_star, lemon_compat
+            )
+            results.append(result)
+
+            # Collect statistics
+            _, payload = result
+            n_candidates = len(payload.get('cstars', []))
+            n_comparisons = len(payload.get('points', []))
+
+            stats['completed'] += 1
+            stats['candidates'] += n_candidates
+            stats['comparisons'] += n_comparisons
+
+        except Exception as e:
+            logging.debug(f"Failed to build curve for star {target_id}: {e}")
+            # Return empty result for this star
+            payload = {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
+            results.append((target_id, payload))
+            stats['failed'] += 1
+
+    return results, stats
+
+
 # ---------------- main ----------------
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     opts = parser.parse_args(argv)
@@ -794,11 +887,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     in_path = Path(opts.input_db)
     out_path = Path(opts.output_db)
 
+    if not in_path.exists():
+        print(f"{style.prefix}Error. Input database '{in_path}' does not exist.")
+        print(getattr(style, "error_exit_message", ""))
+        return 1
+
     if out_path.exists() and opts.overwrite:
         try:
             out_path.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"{style.prefix}Error. Cannot remove existing output database: {e}")
+            print(getattr(style, "error_exit_message", ""))
+            return 1
 
     in_eng = _engine_for(in_path)
     out_eng = _engine_for(out_path)
@@ -807,10 +907,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ensure_schema(out_eng)
 
     # Copy stars & images first
-    print(f"{style.prefix}Making a copy of the input database...", end="")
-    sys.stdout.flush()
-    _copy_stars_images(in_eng, out_eng)
-    print("done.")
+    print(f"{style.prefix}Making a copy of the input database...", end="", flush=True)
+    try:
+        _copy_stars_images(in_eng, out_eng)
+        print("done.")
+    except Exception as e:
+        print(f"\n{style.prefix}Error copying database: {e}")
+        print(getattr(style, "error_exit_message", ""))
+        return 1
 
     # Filters to process
     filters = _list_filters(in_eng)
@@ -829,6 +933,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     auto_tty = sys.stdout.isatty()
     show_progress = (opts.progress or (auto_tty and not opts.no_progress))
 
+    # Global statistics across all filters
+    global_start_time = time.time()
+    global_stats = {
+        'total_stars': 0,
+        'total_curves': 0,
+        'total_measurements': 0,
+        'total_comparison_stars': 0,
+        'filters_processed': 0,
+    }
+
     for pf in sorted(filters):
         print(style.prefix)
         print(f"{style.prefix}Processing filter {pf} ...")
@@ -836,6 +950,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         star_points, star_times = _collect_filter_data(in_eng, pf, min_snr=float(opts.min_snr))
         nstars = len(star_points)
         print(f"{style.prefix}{nstars} stars with usable photometry.")
+
+        global_stats['total_stars'] += nstars
+
         if nstars == 0:
             continue
 
@@ -843,89 +960,176 @@ def main(argv: Sequence[str] | None = None) -> int:
         workers = max(1, int(opts.cores))
         print(f"{style.prefix}Building differential light curves in parallel ({workers} workers).")
 
+        # Split targets into batches for parallel processing
+        batch_size = max(1, len(targets) // (workers * 4))  # 4 batches per worker
+        batches = [targets[i:i + batch_size] for i in range(0, len(targets), batch_size)]
+
+        print(f"{style.prefix}Total targets: {len(targets)}, divided into {len(batches)} batches")
+        print(f"{style.prefix}Batch size: ~{batch_size} stars per batch")
+
         progress = _Progress(total=len(targets), label=f"{style.prefix} progress", enabled=show_progress)
 
         results: List[Tuple[int, dict]] = []
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = [
-                ex.submit(
-                    _build_one_curve,
-                    sid, pf, star_points, star_times,
+        all_stats = {'completed': 0, 'failed': 0, 'candidates': 0, 'comparisons': 0}
+
+        # Statistics tracking
+        start_time = time.time()
+        last_update_time = start_time
+
+        # Use ProcessPoolExecutor for true parallelism (not limited by GIL)
+        with cf.ProcessPoolExecutor(max_workers=workers) as executor:
+            # Submit all batches
+            futures = {}
+            for batch_idx, batch in enumerate(batches):
+                future = executor.submit(
+                    _process_filter_batch,
+                    pf, batch, star_points, star_times,
                     int(opts.min_cmp), bool(opts.robust),
                     float(opts.worst_fraction), int(opts.max_cmp),
-                    dbg_star,
-                    bool(opts.lemon_compat)
+                    dbg_star, bool(opts.lemon_compat)
                 )
-                for sid in targets
-            ]
-            for fut in cf.as_completed(futs):
+                futures[future] = (batch_idx, len(batch))
+
+            # Collect results as they complete with detailed progress
+            completed_batches = 0
+            for future in cf.as_completed(futures):
+                batch_idx, batch_size = futures[future]
                 try:
-                    results.append(fut.result())
+                    batch_results, batch_stats = future.result()
+                    results.extend(batch_results)
+
+                    # Update aggregate statistics
+                    for key in all_stats:
+                        all_stats[key] += batch_stats[key]
+
+                    completed_batches += 1
+                    progress.update(len(batch_results))
+
+                    # Print detailed progress every 2 seconds or when verbose
+                    current_time = time.time()
+                    if opts.verbose or (current_time - last_update_time >= 2.0):
+                        elapsed = current_time - start_time
+                        rate = all_stats['completed'] / elapsed if elapsed > 0 else 0
+
+                        msg = (f"{style.prefix}  Batch {completed_batches}/{len(batches)} done | "
+                               f"Stars: {all_stats['completed']}/{len(targets)} | "
+                               f"Rate: {rate:.1f} stars/s | "
+                               f"Avg candidates: {all_stats['candidates'] / max(1, all_stats['completed']):.1f}")
+
+                        if show_progress:
+                            progress.print_above(msg)
+                        else:
+                            print(msg)
+
+                        last_update_time = current_time
+
                 except Exception as e:
-                    logging.debug("curve worker failed for a star: %s", e)
-                progress.update(1)
+                    logging.error(f"Batch {batch_idx} processing failed: {e}")
+                    completed_batches += 1
+                    progress.update(batch_size)
+                    # Continue with other batches
+
         progress.finish()
 
+        # Final statistics
+        total_time = time.time() - start_time
+        print(style.prefix)
+        print(f"{style.prefix}Differential photometry completed for filter {pf}:")
+        print(f"{style.prefix}  Total time: {total_time:.1f} seconds")
+        print(f"{style.prefix}  Successfully processed: {all_stats['completed']} stars")
+        if all_stats['failed'] > 0:
+            print(f"{style.prefix}  Failed: {all_stats['failed']} stars")
+        print(f"{style.prefix}  Average processing rate: {all_stats['completed'] / total_time:.1f} stars/second")
+        print(f"{style.prefix}  Total comparison stars used: {all_stats['candidates']}")
+        print(f"{style.prefix}  Average comparison stars per target: {all_stats['candidates'] / max(1, all_stats['completed']):.1f}")
+        print(f"{style.prefix}  Total differential measurements: {all_stats['comparisons']}")
+        if all_stats['completed'] > 0:
+            print(f"{style.prefix}  Average measurements per star: {all_stats['comparisons'] / all_stats['completed']:.1f}")
+        print(style.prefix)
+
         # Serialize writes to avoid SQLite contention
+        write_start = time.time()
         print(f"{style.prefix}Saving light curves to the database...")
 
-        debug_payload: dict | None = None
-        with out_eng.begin() as con:
-            # Filter id in the output DB
-            con.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
-                        {"n": str(pf)})
-            f_id = con.execute(text(
-                "SELECT id FROM photometric_filters WHERE name=:n"
-            ), {"n": str(pf)}).scalar_one()
+        # Count what we're about to write
+        total_cmp_stars = sum(1 for _, p in results if p.get("cstars"))
+        total_measurements = sum(len(p.get("points", [])) for _, p in results)
+        print(f"{style.prefix}  Writing {total_cmp_stars} comparison star sets")
+        print(f"{style.prefix}  Writing {total_measurements} light curve measurements")
 
-            # cmp_stars: replace per target/filter
-            for sid, payload in results:
-                if dbg_star is not None and int(sid) == int(dbg_star):
-                    if dbg_filter is None or str(dbg_filter) == str(pf):
-                        debug_payload = payload.get("debug")
+        debug_payload: Optional[dict] = None
+        try:
+            with out_eng.begin() as con:
+                # Filter id in the output DB
+                con.execute(text("INSERT OR IGNORE INTO photometric_filters(name) VALUES (:n)"),
+                            {"n": str(pf)})
+                f_id = con.execute(text(
+                    "SELECT id FROM photometric_filters WHERE name=:n"
+                ), {"n": str(pf)}).scalar_one()
 
-                if payload.get("cstars"):
-                    rows = []
-                    for c, w, sd in zip(payload["cstars"], payload["cweights"], payload["cstdevs"]):
-                        rows.append({"star_id": int(sid), "filter_id": int(f_id),
-                                     "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
-                    con.execute(text(
-                        "DELETE FROM cmp_stars WHERE star_id=:sid AND filter_id=:fid"
-                    ), {"sid": int(sid), "fid": int(f_id)})
-                    if rows:
+                # cmp_stars: replace per target/filter
+                for sid, payload in results:
+                    if dbg_star is not None and int(sid) == int(dbg_star):
+                        if dbg_filter is None or str(dbg_filter) == str(pf):
+                            debug_payload = payload.get("debug")
+
+                    if payload.get("cstars"):
+                        rows = []
+                        for c, w, sd in zip(payload["cstars"], payload["cweights"], payload["cstdevs"]):
+                            rows.append({"star_id": int(sid), "filter_id": int(f_id),
+                                         "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
                         con.execute(text(
-                            "INSERT INTO cmp_stars (star_id, filter_id, cstar_id, stdev, weight) "
-                            "VALUES (:star_id, :filter_id, :cstar_id, :stdev, :weight)"
-                        ), rows)
+                            "DELETE FROM cmp_stars WHERE star_id=:sid AND filter_id=:fid"
+                        ), {"sid": int(sid), "fid": int(f_id)})
+                        if rows:
+                            con.execute(text(
+                                "INSERT INTO cmp_stars (star_id, filter_id, cstar_id, stdev, weight) "
+                                "VALUES (:star_id, :filter_id, :cstar_id, :stdev, :weight)"
+                            ), rows)
 
-            # light_curves upsert
-            lc_rows: List[dict] = []
-            for sid, payload in results:
-                pts = payload["points"]
-                if not pts:
-                    continue
-                for (t, dm, snr) in pts:
-                    iid = _resolve_image_id(out_eng, pf, float(t))
-                    if iid is None:
+                # light_curves upsert
+                lc_rows: List[dict] = []
+                for sid, payload in results:
+                    pts = payload["points"]
+                    if not pts:
                         continue
-                    lc_rows.append({"star_id": int(sid), "image_id": int(iid),
-                                    "magnitude": float(dm),
-                                    "snr": None if snr is None else float(snr)})
-            if lc_rows:
-                con.execute(text(
-                    "INSERT OR REPLACE INTO light_curves (star_id, image_id, magnitude, snr) "
-                    "VALUES (:star_id, :image_id, :magnitude, :snr)"
-                ), lc_rows)
+                    for (t, dm, snr) in pts:
+                        iid = _resolve_image_id(out_eng, pf, float(t))
+                        if iid is None:
+                            continue
+                        lc_rows.append({"star_id": int(sid), "image_id": int(iid),
+                                        "magnitude": float(dm),
+                                        "snr": None if snr is None else float(snr)})
+                if lc_rows:
+                    con.execute(text(
+                        "INSERT OR REPLACE INTO light_curves (star_id, image_id, magnitude, snr) "
+                        "VALUES (:star_id, :image_id, :magnitude, :snr)"
+                    ), lc_rows)
 
-        n_written = sum(1 for _sid, p in results if p["points"])
-        print(f"{style.prefix}{n_written} curves written for filter {pf}.")
+            n_written = sum(1 for _sid, p in results if p["points"])
+            write_time = time.time() - write_start
+
+            # Update global statistics
+            global_stats['filters_processed'] += 1
+            global_stats['total_curves'] += n_written
+            global_stats['total_measurements'] += total_measurements
+            global_stats['total_comparison_stars'] += sum(len(p.get('cstars', [])) for _, p in results)
+
+            print(f"{style.prefix}{n_written} curves written for filter {pf}.")
+            print(f"{style.prefix}Database write time: {write_time:.1f} seconds")
+            print(f"{style.prefix}Write rate: {total_measurements / write_time:.0f} measurements/second")
+        except Exception as e:
+            logging.error(f"Failed to save results to database: {e}")
+            print(f"{style.prefix}Error saving to database: {e}")
+            print(getattr(style, "error_exit_message", ""))
+            return 1
 
         # Debug report (after writes)
         if dbg_star is not None and (dbg_filter is None or str(dbg_filter) == str(pf)):
             if debug_payload:
                 _print_debug_report(pf, debug_payload)
             else:
-                print(f"{style.prefix}DEBUG — star {dbg_star} has no trace for filter {pf} "
+                print(f"{style.prefix}DEBUG ? star {dbg_star} has no trace for filter {pf} "
                       f"(no points or no candidates).")
 
     # metadata (best-effort)
@@ -946,21 +1150,56 @@ def main(argv: Sequence[str] | None = None) -> int:
             con.execute(text(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES ('id', :v)"
             ), {"v": md5.hexdigest()})
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"Failed to write metadata: {e}")
 
     # photometry compat
     _ensure_photometry_compat(out_eng)
 
     # ANALYZE
-    print(f"{style.prefix}Analyzing database statistics...", end="")
-    sys.stdout.flush()
+    print(f"{style.prefix}Analyzing database statistics...", end="", flush=True)
     try:
         with out_eng.begin() as con:
             con.execute(text("ANALYZE"))
-    except Exception:
-        pass
-    print("done.")
+        print("done.")
+    except Exception as e:
+        logging.warning(f"Failed to analyze database: {e}")
+        print("done (with warnings).")
+
+    # Print global summary
+    global_time = time.time() - global_start_time
+    print(style.prefix)
+    print(f"{style.prefix}{'=' * 60}")
+    print(f"{style.prefix}DIFFERENTIAL PHOTOMETRY SUMMARY")
+    print(f"{style.prefix}{'=' * 60}")
+
+    def format_time(seconds: float) -> str:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    print(f"{style.prefix}Total execution time: {format_time(global_time)} ({global_time/60:.1f} minutes)")
+    print(f"{style.prefix}Filters processed: {global_stats['filters_processed']}")
+    print(f"{style.prefix}Stars analyzed: {global_stats['total_stars']}")
+    print(f"{style.prefix}Light curves created: {global_stats['total_curves']}")
+    print(f"{style.prefix}Total differential measurements: {global_stats['total_measurements']}")
+    print(f"{style.prefix}Total comparison stars used: {global_stats['total_comparison_stars']}")
+
+    if global_stats['total_curves'] > 0:
+        avg_measurements = global_stats['total_measurements'] / global_stats['total_curves']
+        avg_comparisons = global_stats['total_comparison_stars'] / global_stats['total_curves']
+        print(f"{style.prefix}Average measurements per light curve: {avg_measurements:.1f}")
+        print(f"{style.prefix}Average comparison stars per target: {avg_comparisons:.1f}")
+
+    if global_time > 0:
+        print(f"{style.prefix}Overall processing rate: {global_stats['total_stars'] / global_time:.1f} stars/second")
+
+    print(f"{style.prefix}Output database: {out_path}")
+    print(f"{style.prefix}{'=' * 60}")
+    print(style.prefix)
     print(f"{style.prefix}You're done ^_^")
     return 0
 
