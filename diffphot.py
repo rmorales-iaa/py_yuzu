@@ -124,13 +124,17 @@ parser.add_argument("-v", "--verbose", action="count", default=getattr(defaults,
                     help="increase output verbosity (repeat for more)")
 
 
-# ---------------- lightweight progress bar ----------------
+# ---------------- Enhanced progress bar ----------------
 class _Progress:
+    """Enhanced progress bar with ETA and statistics."""
+
     def __init__(self, total: int, label: str = "", enabled: bool = True):
-        self.total = max(0, int(total))
+        self.total = max(1, int(total))
         self.label = label
         self.enabled = bool(enabled)
         self.count = 0
+        self.start_time = time.time()
+        self._last_update = 0
         self._last_render = ""
 
     def _term_width(self) -> int:
@@ -144,37 +148,74 @@ class _Progress:
             pct = 100.0
             bar = "#" * 10
             return f"{self.label} [{bar}] 100% ({self.count}/{self.total})"
+
         pct = (self.count / self.total) * 100.0
-        width = max(10, self._term_width() - len(self.label) - 20)
+
+        # Calculate ETA
+        elapsed = time.time() - self.start_time
+        if elapsed > 0 and self.count > 0 and self.count < self.total:
+            rate = self.count / elapsed
+            remaining = (self.total - self.count) / rate
+            eta_min = int(remaining // 60)
+            eta_sec = int(remaining % 60)
+            eta_str = f"{eta_min:02d}:{eta_sec:02d}"
+        else:
+            eta_str = "00:00"
+
+        # Build progress bar
+        width = max(10, min(30, self._term_width() - 90))
         filled = int(round(width * min(1.0, max(0.0, self.count / max(1, self.total)))))
         bar = "#" * filled + "-" * (width - filled)
-        return f"{self.label} [{bar}] {pct:5.1f}% ({self.count}/{self.total})"
+
+        # Calculate rate
+        rate = self.count / elapsed if elapsed > 0 else 0
+
+        return f"{self.label} [{bar}] {pct:5.1f}% | {self.count}/{self.total} | {rate:.1f}/s | ETA {eta_str}"
 
     def update(self, step: int = 1) -> None:
+        """Update progress display."""
         if not self.enabled:
             return
+
         self.count = min(self.total, self.count + int(step))
+
+        # Throttle updates to twice per second
+        now = time.time()
+        if now - self._last_update < 0.5 and self.count < self.total:
+            return
+        self._last_update = now
+
         line = self._render_line()
         try:
             sys.stdout.write("\r" + line)
             sys.stdout.flush()
         except (OSError, UnicodeEncodeError):
-            pass  # Silently ignore encoding issues on some terminals
+            pass
         self._last_render = line
 
     def finish(self) -> None:
+        """Complete the progress bar."""
         if not self.enabled:
             return
+
         self.count = self.total
-        line = self._render_line()
+        elapsed = time.time() - self.start_time
+        rate = self.total / elapsed if elapsed > 0 else 0
+
+        width = max(10, min(30, self._term_width() - 90))
+        bar = "#" * width
+
+        line = f"{self.label} [{bar}] 100.0% | {self.total}/{self.total} | {rate:.1f}/s | Done!\n"
+
         try:
-            sys.stdout.write("\r" + line + "\n")
+            sys.stdout.write("\r" + line)
             sys.stdout.flush()
         except (OSError, UnicodeEncodeError):
             pass
         self._last_render = ""
 
     def clear_line(self) -> None:
+        """Clear the current progress line."""
         if not self.enabled:
             return
         width = self._term_width()
@@ -186,15 +227,16 @@ class _Progress:
         self._last_render = ""
 
     def print_above(self, text: str) -> None:
+        """Print a message above the progress bar."""
         if not self.enabled:
             print(text)
             return
         self.clear_line()
         print(text)
         # redraw current bar
-        if self.count < self.total:
+        if self.count < self.total and self._last_render:
             try:
-                sys.stdout.write("\r" + self._render_line())
+                sys.stdout.write("\r" + self._last_render)
                 sys.stdout.flush()
             except (OSError, UnicodeEncodeError):
                 pass
@@ -202,23 +244,30 @@ class _Progress:
 
 # ---------------- math helpers ----------------
 def _mad_sigma(x: np.ndarray) -> float:
+    """Compute MAD-based robust standard deviation estimate."""
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("inf")
     med = np.median(x)
     return float(1.4826 * np.median(np.abs(x - med)))
 
+
 def _std_sigma(x: np.ndarray) -> float:
+    """Compute standard deviation."""
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("inf")
     # population std; switch to ddof=1 if you want sample std
     return float(np.std(x, ddof=0))
 
+
 def _sigma(x: np.ndarray, robust: bool) -> float:
+    """Compute dispersion (robust or standard)."""
     return _mad_sigma(x) if robust else _std_sigma(x)
 
+
 def _invvar_weight(sd: float) -> float:
+    """Compute inverse-variance weight."""
     if not math.isfinite(sd) or sd <= 0.0:
         return 0.0
     return 1.0 / (sd * sd)
@@ -226,10 +275,13 @@ def _invvar_weight(sd: float) -> float:
 
 # ---------------- DB helpers ----------------
 def _engine_for(path: Path):
+    """Create SQLAlchemy engine for database."""
     path_obj = Path(path) if not isinstance(path, Path) else path
     return create_engine(f"sqlite+pysqlite:///{path_obj}", future=True)
 
+
 def _ensure_schema(eng) -> None:
+    """Ensure output database has required schema."""
     ddl = [
         """
         CREATE TABLE IF NOT EXISTS photometric_filters (
@@ -310,7 +362,9 @@ def _ensure_schema(eng) -> None:
         logging.error(f"Failed to create database schema: {e}")
         raise
 
+
 def _list_filters(eng) -> List[str]:
+    """List all photometric filters in database."""
     try:
         with eng.connect() as con:
             rows = con.execute(text("SELECT name FROM photometric_filters")).all()
@@ -319,7 +373,9 @@ def _list_filters(eng) -> List[str]:
         logging.error(f"Failed to list filters: {e}")
         return []
 
+
 def _copy_stars_images(in_eng, out_eng) -> None:
+    """Copy stars and images from input to output database."""
     try:
         # Stars
         with in_eng.connect() as cin:
@@ -395,10 +451,14 @@ def _copy_stars_images(in_eng, out_eng) -> None:
         logging.error(f"Failed to copy stars and images: {e}")
         raise
 
+
 def _collect_filter_data(in_eng, pfilter: str, min_snr: float
                          ) -> Tuple[Dict[int, List[Tuple[float, float, float]]],
                                     Dict[int, List[float]]]:
-    """Return: (star_points, star_times)."""
+    """
+    Collect photometric data for a filter.
+    Returns: (star_points, star_times) where star_points[star_id] = [(time, mag, snr), ...]
+    """
     star_points: Dict[int, List[Tuple[float, float, float]]] = {}
     star_times: Dict[int, List[float]] = {}
 
@@ -430,7 +490,9 @@ def _collect_filter_data(in_eng, pfilter: str, min_snr: float
 
     return star_points, star_times
 
+
 def _resolve_image_id(out_eng, pfilter: str, unix_time: float) -> Optional[int]:
+    """Resolve image ID from filter name and unix time."""
     try:
         with out_eng.connect() as con:
             rid = con.execute(
@@ -455,6 +517,7 @@ def _matrix_for_target(
     allow_missing: bool = False,
 ):
     """
+    Build photometry matrix for target star.
     Returns:
       y      : target magnitudes aligned to T              (shape [T])
       M      : candidate magnitudes aligned to T           (shape [C, T])
@@ -507,10 +570,8 @@ def _iterative_trim_and_weight(
     lemon_compat: bool = False,
 ):
     """
-    Iteratively drop worst fraction by ? (residuals to ensemble baseline)
-    until ? max_cmp.
-      baseline: median (default) or mean (LEMON compat)
-      NaN handling: ignore NaNs in compat mode
+    Iteratively trim worst comparison stars and compute weights.
+    Returns: (keep_indices, sigmas, weights, trace)
     """
     trace: List[dict] = []
 
@@ -526,11 +587,13 @@ def _iterative_trim_and_weight(
     step = 0
 
     def baseline(A: np.ndarray) -> np.ndarray:
+        """Compute baseline (median or mean)."""
         if not lemon_compat:
             return np.median(A, axis=0)
         return np.nanmean(A, axis=0)
 
     def sigma_row(row: np.ndarray, E: np.ndarray) -> float:
+        """Compute dispersion of residuals for one row."""
         if not lemon_compat:
             return _sigma(row - E, robust=robust)
         res = row - E
@@ -596,12 +659,9 @@ def _build_one_curve(
     lemon_compat: bool = False,
 ):
     """
-    Returns (target_id, payload) where payload has:
-      'cstars'   : List[int]
-      'cweights' : List[float]
-      'cstdevs'  : List[float]
-      'points'   : List[(t, diff_mag, snr)]
-      'debug'    : dict (only for debug_star)
+    Build differential light curve for one target star.
+    Returns (target_id, payload) where payload contains:
+      'cstars', 'cweights', 'cstdevs', 'points', and optionally 'debug'
     """
     y, M, cids, T = _matrix_for_target(
         target_id, star_points, star_times, allow_missing=lemon_compat
@@ -702,6 +762,7 @@ def _build_one_curve(
 
 # ---------------- photometry VIEW/TABLE compat ----------------
 def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
+    """Get SQLite version as a tuple."""
     try:
         with eng.connect() as con:
             v = con.execute(text("SELECT sqlite_version()")).scalar_one()
@@ -718,7 +779,9 @@ def _sqlite_version_tuple(eng) -> Tuple[int, int, int]:
         logging.warning(f"Failed to get SQLite version, assuming (3, 0, 0): {e}")
         return (3, 0, 0)
 
+
 def _ensure_photometry_compat(out_eng) -> None:
+    """Create photometry compatibility view/table for backward compatibility."""
     try:
         with out_eng.connect() as con:
             has_photometry = bool(con.execute(text(
@@ -777,12 +840,15 @@ def _ensure_photometry_compat(out_eng) -> None:
 
 # ---------------- debug output ----------------
 def _fmtf(x: float, n: int = 6) -> str:
+    """Format float with n decimal places."""
     try:
         return f"{float(x):.{n}f}"
     except (ValueError, TypeError):
         return str(x)
 
+
 def _print_debug_report(pf: str, dbg: dict, progress: Optional[_Progress] = None) -> None:
+    """Print detailed debug report for a target star."""
     pre = style.prefix
     def out(line: str):
         if progress:
@@ -910,7 +976,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"{style.prefix}Making a copy of the input database...", end="", flush=True)
     try:
         _copy_stars_images(in_eng, out_eng)
-        print("done.")
+        print(" done.")
     except Exception as e:
         print(f"\n{style.prefix}Error copying database: {e}")
         print(getattr(style, "error_exit_message", ""))
@@ -941,6 +1007,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         'total_measurements': 0,
         'total_comparison_stars': 0,
         'filters_processed': 0,
+        'failed_curves': 0,
     }
 
     for pf in sorted(filters):
@@ -1018,7 +1085,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                         if show_progress:
                             progress.print_above(msg)
-                        else:
+                        elif opts.verbose:
                             print(msg)
 
                         last_update_time = current_time
@@ -1114,10 +1181,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             global_stats['total_curves'] += n_written
             global_stats['total_measurements'] += total_measurements
             global_stats['total_comparison_stars'] += sum(len(p.get('cstars', [])) for _, p in results)
+            global_stats['failed_curves'] += all_stats['failed']
 
             print(f"{style.prefix}{n_written} curves written for filter {pf}.")
             print(f"{style.prefix}Database write time: {write_time:.1f} seconds")
-            print(f"{style.prefix}Write rate: {total_measurements / write_time:.0f} measurements/second")
+            if total_measurements > 0:
+                print(f"{style.prefix}Write rate: {total_measurements / write_time:.0f} measurements/second")
         except Exception as e:
             logging.error(f"Failed to save results to database: {e}")
             print(f"{style.prefix}Error saving to database: {e}")
@@ -1161,10 +1230,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         with out_eng.begin() as con:
             con.execute(text("ANALYZE"))
-        print("done.")
+        print(" done.")
     except Exception as e:
         logging.warning(f"Failed to analyze database: {e}")
-        print("done (with warnings).")
+        print(" done (with warnings).")
 
     # Print global summary
     global_time = time.time() - global_start_time
@@ -1185,6 +1254,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"{style.prefix}Filters processed: {global_stats['filters_processed']}")
     print(f"{style.prefix}Stars analyzed: {global_stats['total_stars']}")
     print(f"{style.prefix}Light curves created: {global_stats['total_curves']}")
+    if global_stats['failed_curves'] > 0:
+        print(f"{style.prefix}Failed curves: {global_stats['failed_curves']}")
     print(f"{style.prefix}Total differential measurements: {global_stats['total_measurements']}")
     print(f"{style.prefix}Total comparison stars used: {global_stats['total_comparison_stars']}")
 

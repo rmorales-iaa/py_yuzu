@@ -10,7 +10,7 @@ with zero-point 25 and SNR).
 This is a Python 3 port of LEMON's photometry.py that preserves upstream CLI
 and console messages while using the provided modules and SQLAlchemy-backed DB.
 
-ENHANCED with real-time progress tracking and statistics.
+ENHANCED with real-time progress tracking and comprehensive statistics.
 """
 
 from __future__ import annotations
@@ -74,11 +74,11 @@ MP_QUEUE = None  # type: ignore
 
 
 # -----------------------------------------------------------------------------
-# Enhanced Progress Display
+# Enhanced Progress Display with Statistics
 # -----------------------------------------------------------------------------
 
 class _EnhancedProgress:
-    """Enhanced progress bar with ETA and statistics."""
+    """Enhanced progress bar with ETA and real-time statistics."""
 
     def __init__(self, total: int, label: str = "", enabled: bool = True):
         self.total = max(1, int(total))
@@ -87,7 +87,14 @@ class _EnhancedProgress:
         self.enabled = enabled and sys.stdout.isatty()
         self.start_time = time.time()
         self._last_update = 0
-        self.stats = {'valid': 0, 'saturated': 0, 'indef': 0, 'snr_filtered': 0}
+        self._last_render = ""
+        self.stats = {
+            'valid': 0,
+            'saturated': 0,
+            'indef': 0,
+            'snr_filtered': 0,
+            'failed': 0
+        }
 
     def _term_width(self) -> int:
         try:
@@ -96,7 +103,7 @@ class _EnhancedProgress:
             return 80
 
     def update(self, count: int = None, stats: dict = None):
-        """Update progress display."""
+        """Update progress display with optional statistics."""
         if not self.enabled:
             return
 
@@ -110,9 +117,9 @@ class _EnhancedProgress:
                 if key in stats:
                     self.stats[key] = stats[key]
 
-        # Throttle updates to once per second
+        # Throttle updates to twice per second for smoother display
         now = time.time()
-        if now - self._last_update < 1.0 and self.current < self.total:
+        if now - self._last_update < 0.5 and self.current < self.total:
             return
         self._last_update = now
 
@@ -131,21 +138,40 @@ class _EnhancedProgress:
             eta_str = "00:00"
 
         # Build progress bar
-        width = max(10, min(40, self._term_width() - 70))
+        width = max(10, min(30, self._term_width() - 90))
         filled = int(width * self.current / self.total)
         bar = "#" * filled + "-" * (width - filled)
 
-        # Build line
-        line = f"\r{self.label} [{bar}] {pct:5.1f}% | {self.current}/{self.total} | {rate:.1f} img/s | ETA {eta_str}"
+        # Build line with statistics
+        parts = [
+            f"{self.label} [{bar}] {pct:5.1f}%",
+            f"{self.current}/{self.total}",
+            f"{rate:.1f} img/s",
+            f"ETA {eta_str}"
+        ]
+
+        # Add statistics if any
+        if self.stats['valid'] > 0:
+            parts.append(f"?{self.stats['valid']}")
+        if self.stats['failed'] > 0:
+            parts.append(f"?{self.stats['failed']}")
+
+        line = " | ".join(parts)
+
+        # Truncate if necessary
+        max_len = self._term_width() - 2
+        if len(line) > max_len:
+            line = line[:max_len - 3] + "..."
 
         try:
-            sys.stdout.write(line)
+            sys.stdout.write("\r" + line)
             sys.stdout.flush()
+            self._last_render = line
         except (OSError, UnicodeEncodeError):
             pass
 
     def finish(self):
-        """Complete the progress bar."""
+        """Complete the progress bar with final statistics."""
         if not self.enabled:
             return
 
@@ -153,16 +179,49 @@ class _EnhancedProgress:
         elapsed = time.time() - self.start_time
         rate = self.total / elapsed if elapsed > 0 else 0
 
-        width = max(10, min(40, self._term_width() - 70))
+        width = max(10, min(30, self._term_width() - 90))
         bar = "#" * width
 
-        line = f"\r{self.label} [{bar}] 100.0% | {self.total}/{self.total} | {rate:.1f} img/s | Done!     \n"
+        parts = [
+            f"{self.label} [{bar}] 100.0%",
+            f"{self.total}/{self.total}",
+            f"{rate:.1f} img/s",
+            "Done!"
+        ]
+
+        line = " | ".join(parts) + "\n"
 
         try:
-            sys.stdout.write(line)
+            sys.stdout.write("\r" + line)
             sys.stdout.flush()
         except (OSError, UnicodeEncodeError):
             pass
+
+    def clear_line(self):
+        """Clear the current progress line."""
+        if not self.enabled:
+            return
+        width = self._term_width()
+        try:
+            sys.stdout.write("\r" + " " * width + "\r")
+            sys.stdout.flush()
+        except (OSError, UnicodeEncodeError):
+            pass
+
+    def print_above(self, text: str):
+        """Print a message above the progress bar."""
+        if not self.enabled:
+            print(text)
+            return
+        self.clear_line()
+        print(text)
+        # Redraw progress if not finished
+        if self.current < self.total and self._last_render:
+            try:
+                sys.stdout.write("\r" + self._last_render)
+                sys.stdout.flush()
+            except (OSError, UnicodeEncodeError):
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -233,7 +292,6 @@ def _build_db_image(img: fitsimage.FITSImage, options) -> database.Image:
     return database.Image(img.path, pfilter, unix_time, object_, airmass, gain, ra, dec)
 
 
-
 def parallel_photometry(args):
     """Worker for Pool.map_async.
 
@@ -242,35 +300,39 @@ def parallel_photometry(args):
     """
     path, pparams, options = args
 
-    img = fitsimage.FITSImage(path)
-    logging.debug("Doing photometry on %s", img.path)
-    logging.debug(
-        "%s: qphot aperture=%.3f annulus=%.3f dannulus=%.3f",
-        img.path, pparams.aperture, pparams.annulus, pparams.dannulus
-    )
+    try:
+        img = fitsimage.FITSImage(path)
+        logging.debug("Doing photometry on %s", img.path)
+        logging.debug(
+            "%s: qphot aperture=%.3f annulus=%.3f dannulus=%.3f",
+            img.path, pparams.aperture, pparams.annulus, pparams.dannulus
+        )
 
-    maximum = int(img.saturation(options.maximum, coaddk=options.coaddk))
-    logging.debug("%s: saturation level = %d ADUs", img.path, maximum)
+        maximum = int(img.saturation(options.maximum, coaddk=options.coaddk))
+        logging.debug("%s: saturation level = %d ADUs", img.path, maximum)
 
-    run_args = (
-        img,
-        options.coordinates,
-        options.epoch,
-        float(pparams.aperture),
-        float(pparams.annulus),
-        float(pparams.dannulus),
-        maximum,
-        options.datek,
-        options.timek,
-        options.exptimek,
-        options.uncimgk,
-    )
-    img_qphot = qphot.run(*run_args, cbox=options.cbox)
-    logging.debug("%s: qphot.run() returned %d records", img.path, len(img_qphot))
+        run_args = (
+            img,
+            options.coordinates,
+            options.epoch,
+            float(pparams.aperture),
+            float(pparams.annulus),
+            float(pparams.dannulus),
+            maximum,
+            options.datek,
+            options.timek,
+            options.exptimek,
+            options.uncimgk,
+        )
+        img_qphot = qphot.run(*run_args, cbox=options.cbox)
+        logging.debug("%s: qphot.run() returned %d records", img.path, len(img_qphot))
 
-    db_image = _build_db_image(img, options)
+        db_image = _build_db_image(img, options)
 
-    MP_QUEUE.put((db_image, img_qphot))
+        MP_QUEUE.put((db_image, img_qphot, None))  # None = no error
+    except Exception as e:
+        logging.error(f"Failed to process {path}: {e}")
+        MP_QUEUE.put((None, None, str(e)))  # Error result
 
 
 # -----------------------------------------------------------------------------
@@ -496,7 +558,7 @@ def main(arguments=None):
             return 1
         print(f"{style.prefix}Using {len(sources_coordinates)} coordinates from file.")
     else:
-        print(f"{style.prefix}No --coordinates provided; detecting sources on the first image with SExtractor?")
+        print(f"{style.prefix}No --coordinates provided; detecting sources on the first image with SExtractor...")
         # Work on a temporary copy to let FITSeeingImage write header keywords
         basename = os.path.basename(sources_img_path)
         root, extension = os.path.splitext(basename)
@@ -714,6 +776,18 @@ def main(arguments=None):
 
         print(f"{style.prefix}Sources image: {sources_img_path}")
 
+        # Global statistics across all filters
+        global_stats = {
+            'total_images': 0,
+            'processed_images': 0,
+            'failed_images': 0,
+            'total_measurements': 0,
+            'saturated': 0,
+            'indef': 0,
+            'snr_filtered': 0,
+        }
+        global_start_time = time.time()
+
         # ------------------------------------------------------------------
         # Do photometry by filter, parallelising per-image computation
         # ------------------------------------------------------------------
@@ -800,41 +874,66 @@ def main(arguments=None):
             result = pool.map_async(parallel_photometry, map_args())
 
             # Enhanced progress display
+            print(style.prefix)
             progress = _EnhancedProgress(len(images), label=f"{style.prefix}Processing", enabled=True)
             progress.update(0)
 
+            # Track statistics in real-time
+            filter_stats = {'valid': 0, 'saturated': 0, 'indef': 0, 'snr_filtered': 0, 'failed': 0}
             last_count = 0
+            completed_count = 0
+
             while not result.ready():
-                time.sleep(0.5)
+                time.sleep(0.3)
                 try:
                     current = MP_QUEUE.qsize()
                     if current != last_count:
-                        progress.update(current)
+                        completed_count = current
+                        progress.update(current, stats=filter_stats)
                         last_count = current
                 except (NotImplementedError, AttributeError):
                     pass
 
                 if logging_level < logging.WARNING:
-                    print()
+                    progress.clear_line()
 
+            # Ensure we process all remaining items
             result.get()
+            pool.close()
+            pool.join()
+
             progress.finish()
 
             print(f"{style.prefix}Storing photometric measurements in the database...")
             sys.stdout.flush()
 
-            # Collect exactly one item per image
-            result_items = [MP_QUEUE.get() for _ in range(len(images))]
+            # Collect all items from queue
+            result_items = []
+            while not MP_QUEUE.empty():
+                try:
+                    result_items.append(MP_QUEUE.get_nowait())
+                except Exception:
+                    break
+
+            # Also collect any from the Pool result
+            if len(result_items) < len(images):
+                result_items = [MP_QUEUE.get() for _ in range(len(images))]
+
             total_items = len(result_items) if result_items else 1
 
             # Enhanced progress for database writes
             write_progress = _EnhancedProgress(total_items, label=f"{style.prefix}Saving", enabled=True)
             write_progress.update(0)
 
-            # Collect statistics
-            filter_stats = {'valid': 0, 'saturated': 0, 'indef': 0, 'snr_filtered': 0}
+            # Reset statistics for this filter
+            filter_stats = {'valid': 0, 'saturated': 0, 'indef': 0, 'snr_filtered': 0, 'failed': 0}
 
-            def _store_one(index, db_image, img_qphot):
+            def _store_one(index, db_image, img_qphot, error):
+                if error is not None:
+                    filter_stats['failed'] += 1
+                    write_progress.update(index + 1, stats=filter_stats)
+                    return
+
                 output_db.add_image(db_image)
                 image_id = output_db.get_or_add_image_id(db_image)
 
@@ -867,22 +966,34 @@ def main(arguments=None):
                 write_progress.update(index + 1, stats=filter_stats)
 
                 if logging_level < logging.WARNING:
-                    print()
+                    write_progress.clear_line()
 
-            # Store with a single fast transaction if available
+            # Store with optimized transaction handling
             if hasattr(output_db, "fast_transaction"):
                 with output_db.fast_transaction():
-                    for idx, (db_image, img_qphot) in enumerate(result_items):
-                        _store_one(idx, db_image, img_qphot)
+                    for idx, (db_image, img_qphot, error) in enumerate(result_items):
+                        _store_one(idx, db_image, img_qphot, error)
             else:
-                for idx, (db_image, img_qphot) in enumerate(result_items):
-                    _store_one(idx, db_image, img_qphot)
+                for idx, (db_image, img_qphot, error) in enumerate(result_items):
+                    _store_one(idx, db_image, img_qphot, error)
 
             write_progress.finish()
+
+            # Update global statistics
+            global_stats['total_images'] += len(images)
+            global_stats['processed_images'] += len(result_items) - filter_stats['failed']
+            global_stats['failed_images'] += filter_stats['failed']
+            global_stats['total_measurements'] += filter_stats['valid']
+            global_stats['saturated'] += filter_stats['saturated']
+            global_stats['indef'] += filter_stats['indef']
+            global_stats['snr_filtered'] += filter_stats['snr_filtered']
 
             # Print filter summary
             print(style.prefix)
             print(f"{style.prefix}Photometry summary for {pf}:")
+            print(f"{style.prefix}  Images processed: {len(result_items) - filter_stats['failed']}/{len(images)}")
+            if filter_stats['failed'] > 0:
+                print(f"{style.prefix}  Failed: {filter_stats['failed']}")
             print(f"{style.prefix}  Valid measurements: {filter_stats['valid']}")
             if filter_stats['saturated']:
                 print(f"{style.prefix}  Saturated: {filter_stats['saturated']}")
@@ -909,6 +1020,54 @@ def main(arguments=None):
         output_db.id = md5.hexdigest()
 
     owner_writable(output_db_path, False)
+
+    # Print global summary
+    global_time = time.time() - global_start_time
+    print(style.prefix)
+    print(f"{style.prefix}{'=' * 60}")
+    print(f"{style.prefix}PHOTOMETRY COMPLETE")
+    print(f"{style.prefix}{'=' * 60}")
+
+    def format_time(seconds: float) -> str:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    print(f"{style.prefix}Total execution time: {format_time(global_time)}")
+    print(f"{style.prefix}Images processed: {global_stats['processed_images']}/{global_stats['total_images']}")
+    if global_stats['failed_images'] > 0:
+        fail_pct = (global_stats['failed_images'] / global_stats['total_images']) * 100
+        print(f"{style.prefix}Failed images: {global_stats['failed_images']} ({fail_pct:.1f}%)")
+
+    success_rate = ((global_stats['processed_images'] / global_stats['total_images']) * 100
+                    if global_stats['total_images'] > 0 else 0)
+    print(f"{style.prefix}Success rate: {success_rate:.1f}%")
+
+    if global_time > 0:
+        rate = global_stats['processed_images'] / global_time
+        print(f"{style.prefix}Processing rate: {rate:.2f} images/second")
+
+    print(f"{style.prefix}")
+    print(f"{style.prefix}Measurements:")
+    print(f"{style.prefix}  Total valid: {global_stats['total_measurements']}")
+    if global_stats['saturated'] > 0:
+        print(f"{style.prefix}  Saturated: {global_stats['saturated']}")
+    if global_stats['indef'] > 0:
+        print(f"{style.prefix}  INDEF: {global_stats['indef']}")
+    if global_stats['snr_filtered'] > 0:
+        print(f"{style.prefix}  Filtered (SNR?1): {global_stats['snr_filtered']}")
+
+    if len(sources_phot) > 0 and global_stats['processed_images'] > 0:
+        avg_per_star = global_stats['total_measurements'] / len(sources_phot)
+        avg_per_image = global_stats['total_measurements'] / global_stats['processed_images']
+        print(f"{style.prefix}  Average per star: {avg_per_star:.1f}")
+        print(f"{style.prefix}  Average per image: {avg_per_image:.1f}")
+
+    print(f"{style.prefix}{'=' * 60}")
+    print(f"{style.prefix}Output database: {output_db_path}")
     print(f"{style.prefix}You're done ^_^")
     return 0
 

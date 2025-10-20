@@ -234,13 +234,15 @@ def _parse_star_args(star_opt: Optional[str], ra_opt: Optional[str], dec_opt: Op
     """Return (ra_deg, dec_deg) if any valid inputs are provided; otherwise None."""
     try:
         if star_opt:
-            ra_s, dec_s = _split_radec_pair(star_opt) or (None, None)
-            if ra_s and dec_s:
+            pair = _split_radec_pair(star_opt)
+            if pair:
+                ra_s, dec_s = pair
                 return _hms_to_deg(ra_s), _dms_to_deg(dec_s)
             return None
         if ra_opt and dec_opt:
             return _hms_to_deg(ra_opt), _dms_to_deg(dec_opt)
-    except Exception:
+    except Exception as e:
+        logging.debug(f"Failed to parse star coordinates: {e}")
         return None
     return None
 
@@ -430,6 +432,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             return diffphot.main(args)
         except Exception as e:
             logging.error(f"diffphot failed: {e}")
+            return 1
+
+    # Special handling for photometry (directly available)
+    if command == "photometry":
+        # Make subcommand visible in child module's usage
+        sys.argv[0] = f"{name} {command}"
+
+        try:
+            import photometry
+        except ImportError as e:
+            logging.error(f"Cannot load photometry module: {e}")
+            print(f"{name}: Error loading photometry. Make sure photometry.py is in the module path.", file=sys.stderr)
+            return 2
+
+        try:
+            return photometry.main(args)
+        except Exception as e:
+            logging.error(f"photometry failed: {e}")
             return 1
 
     # Make subcommand visible in child module's usage
