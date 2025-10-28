@@ -3,15 +3,20 @@
 #------------------------------
 set -x #debug
 #------------------------------
-INPUT_DIR=/home/rafa/Downloads/deleteme/test_1/
-OBJECT=SA98
-OBJECT_POS="06 52 01.89 -0 27 21.6"
+INPUT_DIR=/home/rafa/apps/lemon/data/in/input_dir
+OBJECT=HAT-P-16
+OBJECT_POS="00 38 17.53 +42 27 47.15"
+
+#INPUT_DIR=/home/rafa/Downloads/deleteme/test_1/
+#OBJECT=SA98
+#OBJECT_POS="06 52 01.89 -0 27 21.6"
 #------------------------------
 OUTPUT_DIR="/mnt/uxmal_groups/common_data/photometry/yuzu/${OBJECT}"
 #------------------------------
 YUZU_CONFIGURATION="/mnt/uxmal_groups/common_data/apps/py_yuzu/conf_manager/matilde_conf.txt"
 
-YUZU_DIR="/mnt/uxmal_groups/common_data/apps/py_yuzu"
+YUZU_DIR="/home/rafa/proyecto/py_yuzu"
+#YUZU_DIR="/mnt/uxmal_groups/common_data/apps/py_yuzu"
 YUZU_BIN="./yuzu"
 #------------------------------
 #gather FITS files
