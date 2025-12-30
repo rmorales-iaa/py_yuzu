@@ -107,6 +107,8 @@ parser.add_argument("--worst-fraction", type=float, default=0.25,
 parser.add_argument("--lemon-compat", action="store_true",
                     help="LEMON-like ensemble: mean baseline, allow missing comp points, "
                          "per-epoch weight re-normalization")
+parser.add_argument("--allow-missing", action="store_true",
+                    help="allow missing comparison measurements and renormalize weights per epoch")
 
 # Debug tracer
 parser.add_argument("--debug-star", type=int, default=None,
@@ -271,6 +273,114 @@ def _invvar_weight(sd: float) -> float:
     if not math.isfinite(sd) or sd <= 0.0:
         return 0.0
     return 1.0 / (sd * sd)
+
+
+def _leave_one_out_sigmas(M: np.ndarray, robust: bool) -> np.ndarray:
+    """Compute leave-one-out dispersions for each row in M."""
+    if M.size == 0:
+        return np.empty((0,), dtype=float)
+
+    mask = np.isfinite(M)
+    weights = np.ones(M.shape[0], dtype=float)
+
+    sum_w = np.sum(weights[:, None] * mask, axis=0)
+    sum_wm = np.nansum(M * weights[:, None], axis=0)
+
+    sigmas = np.empty(M.shape[0], dtype=float)
+    for i in range(M.shape[0]):
+        row = M[i]
+        mask_i = mask[i]
+
+        sum_w_excl = sum_w - (weights[i] * mask_i)
+        sum_wm_excl = sum_wm - (weights[i] * row)
+
+        valid = mask_i & (sum_w_excl > 0)
+        if valid.sum() < 2:
+            sigmas[i] = float("inf")
+            continue
+
+        baseline = sum_wm_excl[valid] / sum_w_excl[valid]
+        res = row[valid] - baseline
+        sigmas[i] = _sigma(res, robust=robust)
+
+    return sigmas
+
+
+def _iterative_trim_and_weight_legacy(
+    M: np.ndarray,
+    robust: bool,
+    worst_fraction: float,
+    max_cmp: int,
+    want_trace: bool = False,
+):
+    """Legacy trimming/weighting: baseline = (nan)mean of all candidates."""
+    trace: List[dict] = []
+
+    if M.size == 0:
+        return np.empty((0,), dtype=int), np.empty((0,)), np.empty((0,)), trace
+
+    keep = np.arange(M.shape[0], dtype=int)
+    wf = float(worst_fraction)
+    wf = min(1.0, max(0.0, wf))
+    max_cmp = max(1, int(max_cmp))
+    step = 0
+
+    def baseline(A: np.ndarray) -> np.ndarray:
+        return np.nanmean(A, axis=0)
+
+    def sigma_row(row: np.ndarray, E: np.ndarray) -> float:
+        res = row - E
+        res = res[np.isfinite(res)]
+        if res.size < 2:
+            return float("inf")
+        return _mad_sigma(res) if robust else _std_sigma(res)
+
+    while keep.size > max_cmp:
+        E = baseline(M[keep, :])
+        sig_full = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
+
+        if wf <= 0.0:
+            n_drop = keep.size - max_cmp
+        else:
+            n_drop = int(math.ceil(keep.size * wf))
+            n_drop = max(1, n_drop)
+            if keep.size - n_drop < max_cmp:
+                n_drop = keep.size - max_cmp
+
+        order = np.argsort(sig_full)
+        keep_sorted = keep[order]
+        drop = keep_sorted[-n_drop:]
+        keep = keep_sorted[:-n_drop]
+
+        if want_trace:
+            trace.append({
+                "step": step,
+                "kept_ids": keep.tolist(),
+                "dropped_ids": drop.tolist(),
+                "sigmas_kept": [float(s) for s in sig_full[order[:-n_drop]]],
+                "sigmas_dropped": [float(s) for s in sig_full[order[-n_drop:]]],
+            })
+        step += 1
+
+        if n_drop <= 0:
+            break
+
+    E = baseline(M[keep, :])
+    sig_final = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
+    w = np.array([_invvar_weight(sd) for sd in sig_final], dtype=float)
+    wsum = float(np.nansum(w))
+    if wsum > 0:
+        w /= wsum
+
+    if want_trace:
+        trace.append({
+            "step": step,
+            "final_keep": keep.tolist(),
+            "final_sigmas": [float(s) for s in sig_final],
+            "final_weights": [float(x) for x in w],
+        })
+
+    return keep, sig_final, w, trace
 
 
 # ---------------- DB helpers ----------------
@@ -479,10 +589,13 @@ def _collect_filter_data(in_eng, pfilter: str, min_snr: float
         for sid, t, m, snr in rows:
             if t is None or m is None or snr is None:
                 continue
+            m = float(m)
+            if not math.isfinite(m):
+                continue
             snr = float(snr)
             if not math.isfinite(snr) or snr < float(min_snr):
                 continue
-            star_points.setdefault(int(sid), []).append((float(t), float(m), float(snr)))
+            star_points.setdefault(int(sid), []).append((float(t), m, float(snr)))
             star_times.setdefault(int(sid), []).append(float(t))
     except Exception as e:
         logging.error(f"Failed to collect filter data for {pfilter}: {e}")
@@ -575,6 +688,11 @@ def _iterative_trim_and_weight(
     """
     trace: List[dict] = []
 
+    if lemon_compat:
+        return _iterative_trim_and_weight_legacy(
+            M, robust=robust, worst_fraction=worst_fraction, max_cmp=max_cmp, want_trace=want_trace
+        )
+
     if M.size == 0:
         return np.empty((0,), dtype=int), np.empty((0,)), np.empty((0,)), trace
 
@@ -583,33 +701,19 @@ def _iterative_trim_and_weight(
 
     wf = float(worst_fraction)
     wf = min(1.0, max(0.0, wf))
-    drop_at_least = 1 if wf > 0.0 else 0
+    max_cmp = max(1, int(max_cmp))
     step = 0
 
-    def baseline(A: np.ndarray) -> np.ndarray:
-        """Compute baseline (median or mean)."""
-        if not lemon_compat:
-            return np.median(A, axis=0)
-        return np.nanmean(A, axis=0)
+    while keep.size > max_cmp:
+        sig_full = _leave_one_out_sigmas(M[keep, :], robust=robust)
 
-    def sigma_row(row: np.ndarray, E: np.ndarray) -> float:
-        """Compute dispersion of residuals for one row."""
-        if not lemon_compat:
-            return _sigma(row - E, robust=robust)
-        res = row - E
-        res = res[np.isfinite(res)]
-        if res.size < 2:
-            return float("inf")
-        return _mad_sigma(res) if robust else _std_sigma(res)
-
-    while keep.size > max(1, int(max_cmp)):
-        E = baseline(M[keep, :])
-        sig_full = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
-
-        n_drop = int(math.ceil(keep.size * wf))
-        n_drop = max(drop_at_least, n_drop)
-        if keep.size - n_drop < 1:
-            n_drop = keep.size - 1
+        if wf <= 0.0:
+            n_drop = keep.size - max_cmp
+        else:
+            n_drop = int(math.ceil(keep.size * wf))
+            n_drop = max(1, n_drop)
+            if keep.size - n_drop < max_cmp:
+                n_drop = keep.size - max_cmp
 
         order = np.argsort(sig_full)
         keep_sorted = keep[order]
@@ -625,11 +729,11 @@ def _iterative_trim_and_weight(
                 "sigmas_dropped": [float(s) for s in sig_full[order[-n_drop:]]],
             })
         step += 1
-        if keep.size <= int(max_cmp):
+
+        if n_drop <= 0:
             break
 
-    E = baseline(M[keep, :])
-    sig_final = np.array([sigma_row(M[k, :], E) for k in keep], dtype=float)
+    sig_final = _leave_one_out_sigmas(M[keep, :], robust=robust)
     w = np.array([_invvar_weight(sd) for sd in sig_final], dtype=float)
     wsum = float(np.nansum(w))
     if wsum > 0:
@@ -656,6 +760,7 @@ def _build_one_curve(
     worst_fraction: float,
     max_cmp: int,
     debug_star: Optional[int] = None,
+    allow_missing: bool = False,
     lemon_compat: bool = False,
 ):
     """
@@ -663,8 +768,9 @@ def _build_one_curve(
     Returns (target_id, payload) where payload contains:
       'cstars', 'cweights', 'cstdevs', 'points', and optionally 'debug'
     """
+    allow_missing = bool(allow_missing or lemon_compat)
     y, M, cids, T = _matrix_for_target(
-        target_id, star_points, star_times, allow_missing=lemon_compat
+        target_id, star_points, star_times, allow_missing=allow_missing
     )
     if y.size == 0 or M.size == 0 or len(cids) == 0:
         payload = {"cstars": [], "cweights": [], "cstdevs": [], "points": []}
@@ -700,7 +806,7 @@ def _build_one_curve(
     points: List[Tuple[float, float, float]] = []
     tgt_snr = [s for (_t, _m, s) in star_points.get(target_id, [])]
 
-    if not lemon_compat:
+    if not allow_missing:
         if Msel.shape[0] >= int(min_cmp):
             cmp_mean = np.dot(weights, Msel)  # [T]
             diff = y - cmp_mean
@@ -734,14 +840,7 @@ def _build_one_curve(
     }
 
     if want_trace:
-        # initial ? per candidate against median/mean of ALL candidates
-        if lemon_compat:
-            E0 = np.nanmean(M, axis=0)
-        else:
-            E0 = np.median(M, axis=0)
-        sig0 = [float(_sigma((M[i, :] - E0)[np.isfinite(M[i, :] - E0)] if lemon_compat else (M[i, :] - E0),
-                             robust=robust))
-                for i in range(M.shape[0])]
+        sig0 = _leave_one_out_sigmas(M, robust=robust)
         payload["debug"] = {
             "filter": pfilter,
             "target": int(target_id),
@@ -897,6 +996,7 @@ def _process_filter_batch(
     worst_fraction: float,
     max_cmp: int,
     debug_star: Optional[int],
+    allow_missing: bool,
     lemon_compat: bool,
 ) -> Tuple[List[Tuple[int, dict]], Dict[str, int]]:
     """
@@ -913,7 +1013,7 @@ def _process_filter_batch(
             result = _build_one_curve(
                 target_id, pfilter, star_points, star_times,
                 min_cmp, robust, worst_fraction, max_cmp,
-                debug_star, lemon_compat
+                debug_star, allow_missing, lemon_compat
             )
             results.append(result)
 
@@ -994,6 +1094,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     dbg_star = opts.debug_star
     dbg_filter = (opts.debug_filter.strip() if isinstance(opts.debug_filter, str) and opts.debug_filter else None)
+    allow_missing = bool(opts.allow_missing or opts.lemon_compat)
 
     # Decide progress visibility
     auto_tty = sys.stdout.isatty()
@@ -1053,7 +1154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     pf, batch, star_points, star_times,
                     int(opts.min_cmp), bool(opts.robust),
                     float(opts.worst_fraction), int(opts.max_cmp),
-                    dbg_star, bool(opts.lemon_compat)
+                    dbg_star, allow_missing, bool(opts.lemon_compat)
                 )
                 futures[future] = (batch_idx, len(batch))
 

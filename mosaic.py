@@ -104,6 +104,7 @@ def main(argv=None):
     parser.add_argument('--io-workers', type=int, default=min(mp.cpu_count(), 6),
                         help='Workers for I/O-heavy projection (defaults to min(cpu, 6))')
     parser.add_argument('--chunksize', type=int, default=8, help='Chunk size for parallel maps')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite output file if it exists')
     args = parser.parse_args(argv)
 
     if len(args.files) < 2:
@@ -123,6 +124,13 @@ def main(argv=None):
     os.makedirs(out_root, exist_ok=True)
     if not os.access(out_root, os.W_OK):
         raise RuntimeError(f"Output directory is not writable: {out_root}")
+
+    if os.path.exists(output_file):
+        if args.overwrite:
+            print(f"Overwriting existing output file: {output_file}")
+            os.remove(output_file)
+        else:
+            raise RuntimeError(f"Output file exists: {output_file} (use --overwrite to replace)")
 
     work_dir = tempfile.mkdtemp(dir=out_root, prefix='.mosaic_', suffix=f'_LEMON_{pid}_work')
 

@@ -21,6 +21,7 @@ import collections
 import hashlib
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import os.path
@@ -235,6 +236,13 @@ def _float_or(default, val):
         return float(default)
 
 
+def _float_or_none(val):
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
 def get_fwhm(img, options):
     """Return the FWHM of *img*.
 
@@ -251,7 +259,17 @@ def get_fwhm(img, options):
         logging.debug("%s: keyword '%s' not found; computing FWHM", img.path, options.fwhmk)
 
     if not isinstance(img, seeing.FITSeeingImage):
-        img = seeing.FITSeeingImage(img.path, options.maximum, options.margin, coaddk=options.coaddk)
+        img = seeing.FITSeeingImage(
+            img.path,
+            options.maximum,
+            options.margin,
+            coaddk=options.coaddk,
+            gaink=options.gaink,
+            min_snr=options.detect_min_snr,
+            max_elongation=options.detect_max_elongation,
+            min_area=options.detect_min_area,
+            keep_saturated=options.detect_keep_saturated,
+        )
 
     mode = "mean" if getattr(options, "mean", False) else "median"
     fwhm = float(img.fwhm(per=options.per, mode=mode))
@@ -279,8 +297,10 @@ def _build_db_image(img: fitsimage.FITSImage, options) -> database.Image:
 
     object_ = func_catchall(img.read_keyword, options.objectk)
     airmass = _float_or(0.0, func_catchall(img.read_keyword, options.airmassk))
-    gain = _float_or(0.0, (options.gain if options.gain is not None
-                           else func_catchall(img.read_keyword, options.gaink)))
+    raw_gain = options.gain if options.gain is not None else func_catchall(img.read_keyword, options.gaink)
+    gain = _float_or_none(raw_gain)
+    if gain is not None and (not math.isfinite(gain) or gain <= 0):
+        gain = None
     try:
         ra, dec = img.center_wcs()
         ra = float(ra)
@@ -408,6 +428,8 @@ parser.add_argument("--margin", action="store", type=int, dest="margin", default
                     help=defaults.desc.get("margin", ""))
 parser.add_argument("--gain", action="store", type=float, dest="gain", default=None,
                     help="CCD gain in e-/ADU. If given, do not read from header (--gaink).")
+parser.add_argument("--min-snr", action="store", type=float, dest="min_snr", default=1.0,
+                    help="minimum SNR required to keep a photometric measurement [default: %(default)s]")
 parser.add_argument("--annuli", action="store", type=str, dest="json_annuli", default=None,
                     help="read apertures/annuli from a JSON file produced by the 'annuli' command.")
 parser.add_argument("--cores", action="store", type=int, dest="ncores",
@@ -415,6 +437,20 @@ parser.add_argument("--cores", action="store", type=int, dest="ncores",
                     help=defaults.desc.get("ncores", "parallel workers for photometry"))
 parser.add_argument("-v", "--verbose", action="count", dest="verbose", default=defaults.verbosity,
                     help=defaults.desc.get("verbosity", ""))
+
+# Source detection filters (applied to SExtractor detections on sources image)
+detect_group = parser.add_argument_group(
+    "Source detection filters",
+    "Filters applied to SExtractor detections before building the source list.",
+)
+detect_group.add_argument("--detect-min-snr", action="store", type=float, dest="detect_min_snr",
+                          default=None, help="minimum SNR for a detection to be kept (unset disables)")
+detect_group.add_argument("--detect-max-elongation", action="store", type=float, dest="detect_max_elongation",
+                          default=None, help="maximum elongation (A/B) for a detection to be kept (unset disables)")
+detect_group.add_argument("--detect-min-area", action="store", type=int, dest="detect_min_area",
+                          default=None, help="minimum ISOAREAF_IMAGE in pixels^2 (unset disables)")
+detect_group.add_argument("--detect-keep-saturated", action="store_true", dest="detect_keep_saturated",
+                          default=False, help="keep saturated detections (default: discard)")
 
 # FITS keyword options
 key_group = parser.add_argument_group("FITS Keywords", getattr(keywords, "group_description", ""))
@@ -571,7 +607,17 @@ def main(arguments=None):
         img = fitsimage.FITSImage(tmp_sources_img_path)
         img.delete_keyword(keywords.sex_catalog)
 
-        sources_img = seeing.FITSeeingImage(tmp_sources_img_path, sys.maxsize, options.margin, coaddk=options.coaddk)
+        sources_img = seeing.FITSeeingImage(
+            tmp_sources_img_path,
+            sys.maxsize,
+            options.margin,
+            coaddk=options.coaddk,
+            gaink=options.gaink,
+            min_snr=options.detect_min_snr,
+            max_elongation=options.detect_max_elongation,
+            min_area=options.detect_min_area,
+            keep_saturated=options.detect_keep_saturated,
+        )
 
         # Build coordinates from detections (already trimmed by margin)
         sources_coordinates = sources_img.coordinates
@@ -583,11 +629,12 @@ def main(arguments=None):
 
         if sources_img.ignored:
             ipct = sources_img.ignored / float(sources_img.total) * 100.0
-            rpct = len(sources_img) / float(sources_img.total) * 100.0
             print(f"{style.prefix}{sources_img.ignored} detections ({ipct:.2f} %) within {options.margin} pixels of the edge were removed.")
-            print(f"{style.prefix}There remain {len(sources_img)} sources ({rpct:.2f} %) on which to do photometry.")
-        else:
-            print(f"{style.prefix}Detected {len(sources_img)} sources on which to do photometry.")
+        if sources_img.filtered:
+            fpct = sources_img.filtered / float(sources_img.total) * 100.0
+            print(f"{style.prefix}{sources_img.filtered} detections ({fpct:.2f} %) were filtered by detection criteria.")
+        rpct = len(sources_img) / float(sources_img.total) * 100.0
+        print(f"{style.prefix}There remain {len(sources_img)} sources ({rpct:.2f} %) on which to do photometry.")
 
     options.coordinates = sources_coordinates
 
@@ -927,8 +974,10 @@ def main(arguments=None):
 
             # Reset statistics for this filter
             filter_stats = {'valid': 0, 'saturated': 0, 'indef': 0, 'snr_filtered': 0, 'failed': 0}
+            warned_missing_gain = False
 
             def _store_one(index, db_image, img_qphot, error):
+                nonlocal warned_missing_gain
                 if error is not None:
                     filter_stats['failed'] += 1
                     write_progress.update(index + 1, stats=filter_stats)
@@ -948,8 +997,15 @@ def main(arguments=None):
                         filter_stats['saturated'] += 1
                         continue
 
-                    snr_val = object_phot.snr(db_image.gain)
-                    if snr_val is None or snr_val <= 1:
+                    gain_for_snr = db_image.gain if (db_image.gain is not None and db_image.gain > 0) else None
+                    if gain_for_snr is None:
+                        if not warned_missing_gain:
+                            print(f"{style.prefix}Warning: missing/invalid GAIN; using 1.0 e-/ADU for SNR.")
+                            warned_missing_gain = True
+                        gain_for_snr = 1.0
+
+                    snr_val = object_phot.snr(gain_for_snr)
+                    if snr_val is None or snr_val < float(options.min_snr):
                         filter_stats['snr_filtered'] += 1
                         continue
 

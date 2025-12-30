@@ -31,6 +31,7 @@ a chosen percentile and that has the lowest FWHM.
 
 import atexit
 import logging
+import math
 import multiprocessing
 import numpy
 import argparse
@@ -115,6 +116,44 @@ parser.add_argument(
     dest="per",
     default=defaults.snr_percentile,
     help=defaults.desc["snr_percentile"],
+)
+
+# Source detection filters
+detect_group = OptionGroup(
+    parser,
+    "Source detection filters",
+    "Filters applied to SExtractor detections before counting sources / computing FWHM.",
+)
+detect_group.add_argument(
+    "--detect-min-snr",
+    action="store",
+    type=float,
+    dest="detect_min_snr",
+    default=None,
+    help="minimum SNR for a detection to be kept (unset disables this filter)",
+)
+detect_group.add_argument(
+    "--detect-max-elongation",
+    action="store",
+    type=float,
+    dest="detect_max_elongation",
+    default=None,
+    help="maximum elongation (A/B) for a detection to be kept (unset disables this filter)",
+)
+detect_group.add_argument(
+    "--detect-min-area",
+    action="store",
+    type=int,
+    dest="detect_min_area",
+    default=None,
+    help="minimum ISOAREAF_IMAGE in pixels^2 (unset disables this filter)",
+)
+detect_group.add_argument(
+    "--detect-keep-saturated",
+    action="store_true",
+    dest="detect_keep_saturated",
+    default=False,
+    help="keep saturated detections (default: discard them)",
 )
 
 parser.add_argument(
@@ -251,14 +290,35 @@ customparser.clear_metavars(parser)
 class FITSeeingImage(fitsimage.FITSImage):
     """High-level interface to each FITS image's SExtractor catalog."""
 
-    def __init__(self, path, maximum, margin, coaddk=keywords.coaddk):
+    def __init__(
+        self,
+        path,
+        maximum,
+        margin,
+        coaddk=keywords.coaddk,
+        gaink: str = keywords.gaink,
+        min_snr: float | None = None,
+        max_elongation: float | None = None,
+        min_area: int | None = None,
+        keep_saturated: bool = False,
+    ):
         super().__init__(path)
         self.margin = margin
+        self.min_snr = min_snr
+        self.max_elongation = max_elongation
+        self.min_area = min_area
+        self.keep_saturated = keep_saturated
         logging.debug(f"{self.path}: margin width: {self.margin} px")
 
         # Compute SATUR_LEVEL with effective coadds
         satur_level = self.saturation(maximum, coaddk=coaddk)
         options = dict(SATUR_LEVEL=str(satur_level))
+        try:
+            gain = float(self.read_keyword(gaink))
+            if math.isfinite(gain) and gain > 0:
+                options["GAIN"] = str(gain)
+        except Exception:
+            pass
         sex_md5sum = astromatic.sextractor_md5sum(options=options)
         logging.debug(f"{self.path}: SExtractor MD5 hash: {sex_md5sum}")
 
@@ -316,6 +376,7 @@ class FITSeeingImage(fitsimage.FITSImage):
     def catalog(self):
         """Return the SExtractor catalog (excluding border-margin sources)."""
         self._ignored_sources = 0
+        self._filtered_sources = 0
         catalog = astromatic.Catalog(self.catalog_path)
         logging.info("Removing objects too close to edges of %s", self.path)
         logging.debug("Margin: %d px | Image size: (%d, %d)", self.margin, *self.size)
@@ -330,12 +391,30 @@ class FITSeeingImage(fitsimage.FITSImage):
             ):
                 logging.debug("Star at %.3f, %.3f ignored (too close to edges)", star.x, star.y)
                 self._ignored_sources += 1
+            elif not self.keep_saturated and star.saturated:
+                logging.debug("Star at %.3f, %.3f ignored (saturated)", star.x, star.y)
+                self._filtered_sources += 1
+            elif self.min_snr is not None and star.snr < float(self.min_snr):
+                logging.debug("Star at %.3f, %.3f ignored (SNR %.3f < %.3f)",
+                              star.x, star.y, star.snr, float(self.min_snr))
+                self._filtered_sources += 1
+            elif self.max_elongation is not None and star.elongation > float(self.max_elongation):
+                logging.debug("Star at %.3f, %.3f ignored (elong %.3f > %.3f)",
+                              star.x, star.y, star.elongation, float(self.max_elongation))
+                self._filtered_sources += 1
+            elif self.min_area is not None and star.area < int(self.min_area):
+                logging.debug("Star at %.3f, %.3f ignored (area %d < %d)",
+                              star.x, star.y, star.area, int(self.min_area))
+                self._filtered_sources += 1
+            elif not (math.isfinite(star.snr) and math.isfinite(star.fwhm) and math.isfinite(star.elongation)):
+                logging.debug("Star at %.3f, %.3f ignored (non-finite metrics)", star.x, star.y)
+                self._filtered_sources += 1
             else:
                 kept.append(star)
                 logging.debug("Star at %.3f, %.3f OK", star.x, star.y)
 
         if __debug__:
-            assert len(catalog) == len(kept) + self._ignored_sources
+            assert len(catalog) == len(kept) + self._ignored_sources + self._filtered_sources
 
         return astromatic.Catalog.from_sequence(kept)
 
@@ -351,8 +430,16 @@ class FITSeeingImage(fitsimage.FITSImage):
             return self._ignored_sources
 
     @property
+    def filtered(self):
+        try:
+            return self._filtered_sources
+        except AttributeError:
+            _ = self.catalog
+            return self._filtered_sources
+
+    @property
     def total(self):
-        return len(self) + self.ignored
+        return len(self) + self.ignored + self.filtered
 
     def __getitem__(self, key):
         return self.catalog[key]
@@ -398,7 +485,16 @@ def parallel_sextractor(args):
         shutil.copy2(path, output_path)
         util.owner_writable(output_path, True)  # chmod u+w
 
-        image = FITSeeingImage(output_path, options.maximum, options.margin, coaddk=options.coaddk)
+        image = FITSeeingImage(
+            output_path,
+            options.maximum,
+            options.margin,
+            coaddk=options.coaddk,
+            min_snr=options.detect_min_snr,
+            max_elongation=options.detect_max_elongation,
+            min_area=options.detect_min_area,
+            keep_saturated=options.detect_keep_saturated,
+        )
         fwhm = image.fwhm(per=options.per, mode=mode)
         logging.debug("%s: FWHM = %.3f", path, fwhm)
         elong = image.elongation(per=options.per, mode=mode)

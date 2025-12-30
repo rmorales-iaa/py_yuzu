@@ -71,6 +71,7 @@ command with the --annuli option in order to use these optimal apertures.
 
 # LEMON modules
 import customparser
+import defaults
 import diffphot
 import fitsimage
 import keywords
@@ -101,10 +102,14 @@ parser.add_argument(
 )
 
 # Pass-through of shared options from other modules (kept as-is for compatibility)
-parser.add_argument(photometry.parser.get_option("--margin"))
-parser.add_argument(photometry.parser.get_option("--gain"))
-parser.add_argument(photometry.parser.get_option("--cores"))
-parser.add_argument(photometry.parser.get_option("--verbose"))
+parser.add_argument("--margin", action="store", type=int, dest="margin",
+                    default=defaults.margin, help=defaults.desc.get("margin", ""))
+parser.add_argument("--gain", action="store", type=float, dest="gain", default=None,
+                    help="CCD gain in e-/ADU. If given, do not read from header (--gaink).")
+parser.add_argument("--cores", action="store", type=int, dest="ncores",
+                    default=defaults.ncores, help=defaults.desc.get("ncores", ""))
+parser.add_argument("-v", "--verbose", action="count", dest="verbose",
+                    default=defaults.verbosity, help=defaults.desc.get("verbosity", ""))
 
 # ---------------------------- Initial Photometry ------------------------------
 qphot_group = OptionGroup(
@@ -121,16 +126,37 @@ qphot_group = OptionGroup(
      "Kind of paradoxical, we know.")
 )
 
-qphot_group.add_option(photometry.parser.get_option("--aperture"))
-qphot_group.add_option(photometry.parser.get_option("--annulus"))
-qphot_group.add_option(photometry.parser.get_option("--dannulus"))
+qphot_group.add_option(
+    "--aperture",
+    action="store",
+    type=float,
+    dest="aperture",
+    default=3.0,
+    help="aperture radius, in number of times the median FWHM [default: %(default)s]",
+)
+qphot_group.add_option(
+    "--annulus",
+    action="store",
+    type=float,
+    dest="annulus",
+    default=4.5,
+    help="inner radius of the sky annulus, in times the median FWHM [default: %(default)s]",
+)
+qphot_group.add_option(
+    "--dannulus",
+    action="store",
+    type=float,
+    dest="dannulus",
+    default=1.0,
+    help="width of the sky annulus, in times the median FWHM [default: %(default)s]",
+)
 
 qphot_group.add_option(
     "--min-sky",
     action="store",
     type=float,
     dest="min",
-    default=photometry.parser.defaults["min"],
+    default=3.0,
     help=("the minimum width of the sky annulus, in pixels, regardless of the value "
           "derived from the FWHM. This option is intended to prevent small FWHMs "
           "from resulting in too thin an sky annulus, and applies to both the "
@@ -175,6 +201,14 @@ stats_group.add_option(
           "curves for the percentile of the standard deviations to be calculated. "
           "If fewer than this number of light curves are computed, the parameters "
           "are ignored. [default: %(default)s]"),
+)
+stats_group.add_option(
+    "--minimum-images",
+    action="store",
+    type=int,
+    dest="min_images",
+    default=getattr(defaults, "MIN_IMAGES", 10),
+    help="minimum number of images required for a star's light curve [default: %(default)s]",
 )
 
 # -------------------------------- Search space --------------------------------
@@ -232,8 +266,20 @@ search_group.add_option(
     help="width of the sky annulus, in multiples of each candidate aperture [default = %(default)s]",
 )
 
-search_group.add_option(photometry.parser.get_option("--snr-percentile"))
-search_group.add_option(photometry.parser.get_option("--mean"))
+search_group.add_option(
+    "--snr-percentile",
+    action="store",
+    type=float,
+    dest="per",
+    default=defaults.snr_percentile,
+    help=defaults.desc.get("snr_percentile", ""),
+)
+search_group.add_option(
+    "--mean",
+    action="store_true",
+    dest="mean",
+    help=defaults.desc.get("mean", ""),
+)
 
 # ------------------------------ Stars eligibility -----------------------------
 const_group = OptionGroup(
@@ -243,7 +289,14 @@ const_group = OptionGroup(
      "images if it is to be eligible as a constant star. Candidates must be below "
      "saturation in all images.")
 )
-const_group.add_option(photometry.parser.get_option("--maximum"))
+const_group.add_option(
+    "--maximum",
+    action="store",
+    type=int,
+    dest="maximum",
+    default=defaults.maximum,
+    help=defaults.desc.get("maximum", ""),
+)
 
 # --------------------------- Differential Photometry --------------------------
 diffphot_group = OptionGroup(
@@ -252,25 +305,82 @@ diffphot_group = OptionGroup(
     ("These options (same as in diffphot.py) determine how light curves are generated.")
 )
 
-diffphot_group.add_option(diffphot.parser.get_option("--minimum-images"))
-diffphot_group.add_option(diffphot.parser.get_option("--minimum-stars"))
-diffphot_group.add_option(diffphot.parser.get_option("--pct"))
-diffphot_group.add_option(diffphot.parser.get_option("--weights-threshold"))
-diffphot_group.add_option(diffphot.parser.get_option("--max-iters"))
-diffphot_group.add_option(diffphot.parser.get_option("--worst-fraction"))
+diffphot_group.add_option(
+    "--min-snr",
+    action="store",
+    type=float,
+    dest="min_snr",
+    default=1.0,
+    help="ignore photometric points with SNR below this threshold [default: %(default)s]",
+)
+diffphot_group.add_option(
+    "--min-cmp",
+    action="store",
+    type=int,
+    dest="min_cmp",
+    default=5,
+    help="minimum number of comparison stars required per epoch [default: %(default)s]",
+)
+diffphot_group.add_option(
+    "--max-cmp",
+    action="store",
+    type=int,
+    dest="max_cmp",
+    default=20,
+    help="maximum number of comparison stars per target [default: %(default)s]",
+)
+diffphot_group.add_option(
+    "--robust",
+    action="store_true",
+    dest="robust",
+    default=False,
+    help="use robust (MAD) dispersion instead of plain standard deviation",
+)
+diffphot_group.add_option(
+    "--allow-missing",
+    action="store_true",
+    dest="allow_missing",
+    default=False,
+    help="allow missing comparison measurements and renormalize weights per epoch",
+)
+diffphot_group.add_option(
+    "--lemon-compat",
+    action="store_true",
+    dest="lemon_compat",
+    default=False,
+    help="LEMON-like ensemble (mean baseline, allow missing, renormalize weights)",
+)
+diffphot_group.add_option(
+    "--worst-fraction",
+    action="store",
+    type=float,
+    dest="worst_fraction",
+    default=0.25,
+    help="fraction of worst candidates to discard at each trimming step [default: %(default)s]",
+)
 
 # -------------------------------- FITS keywords -------------------------------
 key_group = OptionGroup(parser, "FITS Keywords", keywords.group_description)
-key_group.add_option(photometry.parser.get_option("--objectk"))
-key_group.add_option(photometry.parser.get_option("--filterk"))
-key_group.add_option(photometry.parser.get_option("--datek"))
-key_group.add_option(photometry.parser.get_option("--timek"))
-key_group.add_option(photometry.parser.get_option("--expk"))
-key_group.add_option(photometry.parser.get_option("--coaddk"))
-key_group.add_option(photometry.parser.get_option("--gaink"))
-key_group.add_option(photometry.parser.get_option("--fwhmk"))
-key_group.add_option(photometry.parser.get_option("--airmk"))
-key_group.add_option(photometry.parser.get_option("--uik"))
+key_group.add_option("--objectk", action="store", type=str, dest="objectk",
+                     default=keywords.objectk, help=keywords.desc["objectk"])
+key_group.add_option("--filterk", action="store", type=str, dest="filterk",
+                     default=keywords.filterk, help=keywords.desc["filterk"])
+key_group.add_option("--datek", action="store", type=str, dest="datek",
+                     default=keywords.datek, help=keywords.desc["datek"])
+key_group.add_option("--timek", action="store", type=str, dest="timek",
+                     default=keywords.timek, help=keywords.desc["timek"])
+key_group.add_option("--expk", action="store", type=str, dest="exptimek",
+                     default=keywords.exptimek, help=keywords.desc["exptimek"])
+key_group.add_option("--coaddk", action="store", type=str, dest="coaddk",
+                     default=keywords.coaddk, help=keywords.desc["coaddk"])
+key_group.add_option("--gaink", action="store", type=str, dest="gaink",
+                     default=keywords.gaink, help=keywords.desc["gaink"])
+key_group.add_option("--fwhmk", action="store", type=str, dest="fwhmk",
+                     default=keywords.fwhmk, help=keywords.desc["fwhmk"])
+key_group.add_option("--airmk", action="store", type=str, dest="airmassk",
+                     default=keywords.airmassk, help=keywords.desc["airmassk"])
+key_group.add_option("--uik", action="store", type=str, dest="uncimgk",
+                     default=keywords.uncimgk, help=keywords.desc["uncimgk"])
 
 customparser.clear_metavars(parser)
 
@@ -407,26 +517,25 @@ def main(arguments: list[str] | None = None) -> int:
 
     diff_args = [
         phot_db_path,
-        "--output",
         diffphot_db_path,
         "--overwrite",
         "--cores",
         options.ncores,
-        "--minimum-images",
-        options.min_images,
-        "--stars",
-        options.nconstant,
-        "--minimum-stars",
-        options.min_cstars,
-        "--pct",
-        options.pct,
-        "--weights-threshold",
-        options.wminimum,
-        "--max-iters",
-        options.max_iters,
+        "--min-snr",
+        options.min_snr,
+        "--min-cmp",
+        options.min_cmp,
+        "--max-cmp",
+        options.max_cmp,
         "--worst-fraction",
         options.worst_fraction,
     ]
+    if options.robust:
+        diff_args.append("--robust")
+    if options.allow_missing:
+        diff_args.append("--allow-missing")
+    if options.lemon_compat:
+        diff_args.append("--lemon-compat")
     for _ in range(getattr(options, "verbose", 0)):
         diff_args.append("-v")
 

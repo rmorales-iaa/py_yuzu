@@ -5,6 +5,7 @@ import collections
 import functools
 import hashlib
 import logging
+import math
 import os
 import re
 import subprocess
@@ -167,7 +168,15 @@ class Catalog(tuple):
         mag_index = get_index("MAG_AUTO")
         flux_index = get_index("FLUX_ISO")
         fluxerr_index = get_index("FLUXERR_ISO")
-        flux_radius_index = get_index("FLUX_RADIUS")
+        try:
+            fwhm_index = get_index("FWHM_IMAGE")
+        except ValueError:
+            fwhm_index = None
+
+        try:
+            flux_radius_index = get_index("FLUX_RADIUS")
+        except ValueError:
+            flux_radius_index = None
         flags_index = get_index("FLAGS")
         elong_index = get_index("ELONGATION")
 
@@ -185,13 +194,23 @@ class Catalog(tuple):
                 mag = get_param(mag_index)
                 flux = get_param(flux_index)
                 fluxerr = get_param(fluxerr_index)
-                flux_radius = get_param(flux_radius_index)
+                fwhm = None
+                if fwhm_index is not None:
+                    fwhm = get_param(fwhm_index)
+                    if not math.isfinite(fwhm) or fwhm <= 0:
+                        fwhm = None
+
+                if fwhm is None:
+                    if flux_radius_index is None:
+                        fwhm = 0.0
+                    else:
+                        flux_radius = get_param(flux_radius_index)
+                        fwhm = flux_radius * 2.0
                 flags = get_param(flags_index, type_=int)
                 elongation = get_param(elong_index)
 
                 saturated = Catalog.flag_saturated(flags)
                 snr = (flux / fluxerr) if fluxerr != 0 else 0.0
-                fwhm = flux_radius * 2.0
                 yield Star(
                     x, y, alpha, delta, area, mag, saturated, snr, fwhm, elongation
                 )

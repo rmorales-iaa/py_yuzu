@@ -26,25 +26,29 @@ fi
 
 for fits_file in "${files[@]}"; do
   # How many HDUs?
-  if ! nhdus=$(astfits "$fits_file" --numhdus 2>/dev/null); then
+  if ! nhdus_raw=$(astfits "$fits_file" --numhdus 2>/dev/null); then
     echo "[$fits_file] Could not read number of HDUs (skipping)."
+    continue
+  fi
+  nhdus=$(printf '%s' "$nhdus_raw" | tr -d '[:space:]')
+  if ! [[ "$nhdus" =~ ^[0-9]+$ ]]; then
+    echo "[$fits_file] Non-numeric HDU count: '$nhdus_raw' (skipping)."
     continue
   fi
 
   has_gain=false
   gain_hdu=-1
 
-  # Prefer a method that works on old/new gnuastro: print-all + grep
+  # Robust check: ask astfits directly for the key's value.
   for ((h=0; h<nhdus; h++)); do
-    if astfits "$fits_file" --hdu="$h" --quiet --printallkeys 2>/dev/null \
-        | grep -qE '^[[:space:]]*GAIN[[:space:]]*='; then
+    if astfits "$fits_file" --hdu="$h" --quiet --keyvalue=GAIN >/dev/null 2>&1; then
       has_gain=true
       gain_hdu=$h
       break
     fi
   done
 
-  if "$has_gain"; then
+  if $has_gain; then
     echo "[$fits_file] GAIN present in HDU $gain_hdu (no change)."
   else
     echo "[$fits_file] Adding GAIN=1.0 to HDU 0"

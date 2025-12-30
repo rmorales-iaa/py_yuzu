@@ -15,8 +15,8 @@ PARAMETERS_NAME  sextractor.param  # name of the file containing catalog content
 DETECT_TYPE      CCD            # "CCD" or "PHOTO"
 FLAG_IMAGE       flag.fits      # filename for an input FLAG-image
 DETECT_MINAREA   5              # minimum number of pixels above threshold
-DETECT_THRESH    1.5		# <sigmas> or <threshold>,<ZP> in mag.arcsec-2
-ANALYSIS_THRESH  100.0          # <sigmas> or <threshold>,<ZP> in mag.arcsec-2
+DETECT_THRESH    1.5            # <sigmas> or <threshold>,<ZP> in mag.arcsec-2
+ANALYSIS_THRESH  1.5            # <sigmas> or <threshold>,<ZP> in mag.arcsec-2
 
 FILTER           Y              # apply filter for detection ("Y" or "N")?
 FILTER_NAME      sextractor.conv   # name of the file containing the filter
@@ -44,7 +44,8 @@ SATUR_KEY        DUMMY123PI	# keyword for the saturation level (in ADUs); this w
 MAG_ZEROPOINT    25.0           # the zero point of the magnitude scale (IRAF qphot's zmag)
 MAG_GAMMA        4.0            # gamma of emulsion (for photographic scans)
 GAIN             0.0            # detector gain in e-/ADU
-PIXEL_SCALE      1.0            # size of pixel in arcsec (0=use FITS WCS info)
+GAIN_KEY         GAIN           # FITS keyword for gain (used when GAIN=0)
+PIXEL_SCALE      0.0            # size of pixel in arcsec (0=use FITS WCS info)
 
 #------------------------- Star/Galaxy Separation ----------------------------
 

@@ -148,8 +148,7 @@ prepare_dirs() {
 #-----------------------------
 run_wcs_solver() {
   log "Running WCS solve..."
-  cd "${ASTROMETRY_DIR}"
-  "${WCS_SOLVER_SCRIPT}" "${INPUT_IMAGE_DIR}" "${INPUT_IMAGE_WCS_SOLVED_DIR}"
+  ( cd "${ASTROMETRY_DIR}" && "${WCS_SOLVER_SCRIPT}" "${INPUT_IMAGE_DIR}" "${INPUT_IMAGE_WCS_SOLVED_DIR}" )
   log "WCS solve completed."
 }
 #-----------------------------
@@ -166,7 +165,7 @@ gather_wcs_fits() {
 #-----------------------------
 ensure_gain_fits_keyword() {
   log "Ensuring FITS keyword GAIN is present in .fits files..."
-  ./add_gain_fits_keyword.bash ${INPUT_IMAGE_WCS_SOLVED_DIR}"
+  ( cd "${YUZU_DIR}" && ./add_gain_fits_keyword.bash "${INPUT_IMAGE_WCS_SOLVED_DIR}" )
   log "Ensured FITS keyword GAIN is present in .fits files."
 }
 #-----------------------------
@@ -175,29 +174,25 @@ ensure_gain_fits_keyword() {
 run_mosaic() {
   log "[yuzu] Creating mosaic..."
   mkdir -p -- "${OUTPUT_DIR}"
-  cd "${YUZU_DIR}"
-  "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" mosaic "${FITS_FILES[@]}" "${OUTPUT_DIR}/stacked.fits"
+  ( cd "${YUZU_DIR}" && "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" mosaic "${FITS_FILES[@]}" "${OUTPUT_DIR}/stacked.fits" )
   log "Mosaic saved to ${OUTPUT_DIR}/stacked.fits"
 }
 #-----------------------------
 run_photometry() {
   log "[yuzu] Photometry..."
-  cd "${YUZU_DIR}"
-  "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" photometry "${OUTPUT_DIR}/stacked.fits" "${FITS_FILES[@]}" "${OUTPUT_DIR}/photometry.db"
+  ( cd "${YUZU_DIR}" && "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" photometry "${OUTPUT_DIR}/stacked.fits" "${FITS_FILES[@]}" "${OUTPUT_DIR}/photometry.db" )
   log "Photometry DB: ${OUTPUT_DIR}/photometry.db"
 }
 #-----------------------------
 run_diffphot() {
   log "[yuzu] Differential photometry..."
-  cd "${YUZU_DIR}"
-  "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" diffphot "${OUTPUT_DIR}/photometry.db" "${OUTPUT_DIR}/light_curve.db"
+  ( cd "${YUZU_DIR}" && "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" diffphot "${OUTPUT_DIR}/photometry.db" "${OUTPUT_DIR}/light_curve.db" )
   log "Light curve DB: ${OUTPUT_DIR}/light_curve.db"
 }
 #-----------------------------
 run_juicer() {
   log "[yuzu] Juicer (star: ${OBJECT_POS})..."
-  cd "${YUZU_DIR}"
-  "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" juicer "${OUTPUT_DIR}/light_curve.db" --star "${OBJECT_POS}"
+  ( cd "${YUZU_DIR}" && "${YUZU_BIN}" --config "${YUZU_CONFIGURATION}" juicer "${OUTPUT_DIR}/light_curve.db" --star "${OBJECT_POS}" )
   log "Juicer completed."
 }
 #-----------------------------
