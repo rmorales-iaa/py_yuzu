@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# PyRAF / IRAF runtime artifacts
+src/py_yuzu/pyraf/clcache.sqlite3
+src/py_yuzu/pyraf/.nfs*
+src/py_yuzu/uparm/*.par
