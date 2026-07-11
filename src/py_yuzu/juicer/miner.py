@@ -276,8 +276,8 @@ class LEMONdBMiner:
         self,
         star_id: int,
         pfilter: Any | None = None,
-    ) -> List[Tuple[int, float, float]]:
-        """Return (cstar_id, weight, stdev) sorted by usefulness (weight desc, sigma asc)."""
+    ) -> List[Tuple[int, float, Any]]:
+        """Return (cstar_id, weight, stdev_or_None) sorted by usefulness."""
         if not _table_exists(self._conn, "cmp_stars"):
             return []
         fid = self._resolve_filter_id(pfilter, star_id)
@@ -294,10 +294,14 @@ class LEMONdBMiner:
             (int(star_id), int(fid)),
         ).fetchall()
 
-        out: List[Tuple[int, float, float]] = []
+        out: List[Tuple[int, float, Any]] = []
         for r in rows:
             try:
-                out.append((int(r["cstar_id"]), float(r["weight"]), float(r["stdev"])))
+                out.append((
+                    int(r["cstar_id"]),
+                    float(r["weight"]),
+                    None if r["stdev"] is None else float(r["stdev"]),
+                ))
             except Exception:
                 continue
         return out
@@ -337,7 +341,7 @@ class LEMONdBMiner:
                     {
                         "cstar_id": int(r["cstar_id"]),
                         "weight": float(r["weight"]),
-                        "stdev": float(r["stdev"]),
+                        "stdev": None if r["stdev"] is None else float(r["stdev"]),
                         "ra": float(r["ra"]),
                         "dec": float(r["dec"]),
                         "imag": None if r["imag"] is None else float(r["imag"]),

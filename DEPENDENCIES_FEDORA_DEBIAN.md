@@ -244,6 +244,8 @@ Then install separately if missing:
   - `astrometry.net`
 - `diffphot`
   - `numpy`, `sqlalchemy`
+  - supports both `--precision-mode` and `--lemon-mode`; neither mode adds
+    extra Python or system dependencies beyond the normal `diffphot` stack
 - `juicer`
   - `PyGObject`, GTK4, `matplotlib`, `Pillow`, `opencv-python`, `scikit-image`
 

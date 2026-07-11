@@ -96,19 +96,19 @@ FRACTION = 0.10
 MIN_IMAGES = 10
 
 # Number of stars used to build the artificial comparison star
-STARS = 20
+STARS = 5
 
 # Minimum number of stars required to compute the artificial comparison star
-MIN_CSTARS = 8
+MIN_CSTARS = 5
 
 # Number of stars to keep as the "best" set when selecting
-BEST_STARS = 20
+BEST_STARS = 5
 
 # Polynomial fitting defaults
 DEGREE = 2
 MAX_DEGREE = 5
 
 # Number of best stars to use when computing comparison set (diffphot)
-BEST_STARS = 100
+BEST_STARS = 5
 
 logger = logging.getLogger(__name__)

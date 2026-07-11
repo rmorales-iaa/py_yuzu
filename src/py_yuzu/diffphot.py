@@ -88,7 +88,7 @@ parser.add_argument("--filter", action="append", dest="filters", default=None,
 parser.add_argument("--min-snr", type=float, default=1.0,
                     help="ignore photometric points with SNR below this threshold")
 
-parser.add_argument("--max-cmp", type=int, default=20,
+parser.add_argument("--max-cmp", type=int, default=5,
                     help="maximum number of comparison stars per target; use 0 to keep all passing candidates")
 
 parser.add_argument("--min-cmp", type=int, default=5,
@@ -138,6 +138,10 @@ parser.add_argument("--diagnostics", action="store_true",
 parser.add_argument("--precision-mode", action="store_true",
                     help="run the reproducible millimagnitude profile: strict Broeg+05, robust scatter, "
                          "complete high-SNR ensembles, and a precision acceptance report")
+parser.add_argument("--lemon-mode", action="store_true",
+                    help="run an upstream-LEMON-like profile: complete comparison stars, "
+                         "Broeg+05 inverse-sigma weights, no extra candidate SNR gate, "
+                         "and classic trimming defaults")
 parser.add_argument("--precision-goal-rms", type=float, default=0.001,
                     help="RMS goal in magnitudes used by --precision-mode")
 parser.add_argument("--precision-min-snr", type=float, default=1100.0,
@@ -727,7 +731,7 @@ def _ensure_schema(eng) -> None:
             star_id   INTEGER NOT NULL,
             filter_id INTEGER NOT NULL,
             cstar_id  INTEGER NOT NULL,
-            stdev     REAL NOT NULL,
+            stdev     REAL,
             weight    REAL NOT NULL,
             FOREIGN KEY (star_id)   REFERENCES stars(id),
             FOREIGN KEY (filter_id) REFERENCES photometric_filters(id),
@@ -1203,6 +1207,8 @@ def _build_one_curve(
     sel_ids = [cids[i] for i in keep_idx.tolist()]
     sel_w   = weights.astype(float).tolist()
     sel_sd  = sigmas.astype(float).tolist()
+    if len(sel_sd) == 1 and (not math.isfinite(float(sel_sd[0])) or float(sel_sd[0]) == 0.0):
+        sel_sd = [None]
 
     # Weighted differential curve
     Msel = M[keep_idx, :]  # [C, T]
@@ -1428,7 +1434,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         weight_mode = "inverse-sigma"
         min_candidate_epoch_fraction = 1.0
         if not user_set_max_cmp:
-            max_cmp = 0
+            max_cmp = 5
+
+    if opts.lemon_mode:
+        # Approximate upstream LEMON defaults:
+        # - complete comparison stars only
+        # - Broeg-style inverse-sigma artificial comparison star
+        # - no additional candidate-median-SNR gate
+        # - classic trimming and pool-size defaults
+        broeg_strict = True
+        weight_mode = "inverse-sigma"
+        min_candidate_epoch_fraction = 1.0
+        opts.min_candidate_snr = 0.0
+        if not user_set_max_cmp:
+            max_cmp = 20
+        if not user_set_min_cmp:
+            opts.min_cmp = 8
+        if not any(arg == "--worst-fraction" or arg.startswith("--worst-fraction=") for arg in argv):
+            opts.worst_fraction = 0.10
 
     if opts.precision_mode:
         # Broeg et al. (2005) artificial comparison star is mandatory for
@@ -1438,7 +1461,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         broeg_strict = True
         weight_mode = "inverse-sigma"
         robust = True
-        max_cmp = 0
+        if not user_set_max_cmp:
+            max_cmp = 5
         min_candidate_epoch_fraction = 1.0
         if not user_set_min_cmp:
             # Precision mode already applies an explicit acceptance gate on the
@@ -1666,7 +1690,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         rows = []
                         for c, w, sd in zip(payload["cstars"], payload["cweights"], payload["cstdevs"]):
                             rows.append({"star_id": int(sid), "filter_id": int(f_id),
-                                         "cstar_id": int(c), "stdev": float(sd), "weight": float(w)})
+                                         "cstar_id": int(c),
+                                         "stdev": (None if sd is None else float(sd)),
+                                         "weight": float(w)})
                         con.execute(text(
                             "DELETE FROM cmp_stars WHERE star_id=:sid AND filter_id=:fid"
                         ), {"sid": int(sid), "fid": int(f_id)})
