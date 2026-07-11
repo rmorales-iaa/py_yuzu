@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+yuzu - Main entry point for LEMON/Yuzu astronomical photometry pipeline
+
+This is the primary command-line interface for the Yuzu/LEMON system,
+which provides a Git-like interface to various astronomical data processing commands.
+
+Usage:
+    yuzu [--config PATH] [--help] [--version] COMMAND [ARGS]
+
+Commands:
+    astrometry   - Calibrate images astrometrically
+    mosaic       - Assemble images into a mosaic
+    photometry   - Perform aperture photometry
+    diffphot     - Generate differential light curves
+    juicer       - LEMONdB browser and variability analyzer
+    export       - Print light curve of an object
+    import       - Group images of an observing campaign
+    seeing       - Discard images with bad seeing
+    annuli       - Find optimal photometry parameters
+"""
+
+from __future__ import annotations
+
+import difflib
+import importlib
+import logging
+import os
+import sys
+import glob
+import re
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Default to software GTK rendering. Headless and remote sessions otherwise
+# emit noisy EGL/DRI warnings when GL is forced.
+os.environ.setdefault("GSK_RENDERER", "cairo")
+
+# Allow rebinding the configuration file before importing UI modules
+try:
+    from conf_manager.conf_manager import cfg
+except (ImportError, ModuleNotFoundError):
+    cfg = None  # type: ignore
+
+API_QUERY_TIMEOUT = 2  # seconds
+
+LEMON_COMMANDS = [
+    "annuli",
+    "astrometry",
+    "diffphot",
+    "export",
+    "import",
+    "juicer",
+    "mosaic",
+    "offsets",
+    "photometry",
+    "seeing",
+]
+
+DEFAULT_CFG_REL = "conf_manager/configuration.txt"
+
+
+def show_help(name: str) -> None:
+    """Help message, listing all commands, that looks like Git's."""
+    print(f"usage: {name} [--config PATH] [--help] [--version] COMMAND [ARGS]\n")
+    print("Global options:")
+    print("   -c, --config PATH   Path to configuration INI (default: conf_manager/configuration.txt)\n")
+    print("The essential commands are:")
+    print("   astrometry   Calibrate the images astrometrically")
+    print("   mosaic       Assemble the images into a mosaic")
+    print("   photometry   Perform aperture photometry")
+    print("   diffphot     Generate differential light curves")
+    print("   juicer       LEMONdB browser and variability analyzer")
+    print("   export       Print the light curve of an object\n")
+    print("The auxiliary, not-always-necessary commands are:")
+    print("   import       Group the images of an observing campaign")
+    print("   seeing       Discard images with bad seeing or elongated")
+    print("   annuli       Find optimal parameters for photometry\n")
+    print(f"See '{name} COMMAND --help' for more information on a specific command.")
+
+
+def _expand_arg(arg: str) -> List[str]:
+    """Expand env vars, ~, and globs. If a glob has no matches, keep literal."""
+    expanded = os.path.expandvars(os.path.expanduser(arg))
+    if glob.has_magic(expanded):
+        matches = sorted(glob.glob(expanded))
+        return matches if matches else [expanded]
+    return [expanded]
+
+
+def _expand_args(argv: List[str]) -> List[str]:
+    """Expand all arguments for environment variables, home directory, and globs."""
+    out: List[str] = []
+    for a in argv:
+        out.extend(_expand_arg(a))
+    return out
+
+
+def _extract_global_config(argv: List[str]) -> Tuple[Optional[str], List[str]]:
+    """
+    Pull a --config PATH / -c PATH (or --config=PATH) option out of argv.
+    Returns (config_path, remaining_argv).
+    """
+    cfg_path: Optional[str] = None
+    rem: List[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--config" or a == "-c":
+            if i + 1 < len(argv):
+                cfg_path = argv[i + 1]
+                i += 2
+                continue
+            else:
+                print("error: --config expects a PATH", file=sys.stderr)
+                sys.exit(2)
+        elif a.startswith("--config="):
+            cfg_path = a.split("=", 1)[1]
+            i += 1
+            continue
+        else:
+            rem.append(a)
+            i += 1
+    return cfg_path, rem
+
+
+def _rebind_cfg_if_requested(cfg_path_opt: Optional[str]) -> None:
+    """Rebind configuration if requested and available."""
+    if cfg is None:
+        return
+    base_default = Path(__file__).resolve().parent / DEFAULT_CFG_REL
+    if cfg_path_opt:
+        cfg.rebind(cfg_path_opt)
+    else:
+        cfg.rebind(base_default)
+
+
+# ------------------ RA/Dec parsing helpers (hms/dms -> degrees) ------------------
+
+def _hms_to_deg(s: str) -> float:
+    """
+    Convert RA in sexagesimal to degrees.
+    Accepts: 'hh mm ss(.sss)', 'hh:mm:ss(.sss)', 'hhhmmmsss', '12h34m56.7s'
+    """
+    t = s.strip().lower().replace("h", ":").replace("m", ":").replace("s", "")
+    parts = [p for p in re.split(r"[:\s]+", t) if p]
+    if not parts:
+        raise ValueError("empty RA")
+    h = float(parts[0])
+    m = float(parts[1]) if len(parts) > 1 else 0.0
+    sec = float(parts[2]) if len(parts) > 2 else 0.0
+    deg = (abs(h) + m / 60.0 + sec / 3600.0) * 15.0
+    return (-deg if str(h).startswith("-") else deg) % 360.0
+
+
+def _dms_to_deg(s: str) -> float:
+    """
+    Convert Dec in sexagesimal to degrees.
+    Accepts: '±dd mm ss(.ss)', '±dd:mm:ss(.ss)', '±dd°mm'ss"', '±ddmmss',
+             and '±12d34m56s'
+    """
+    t = (
+        s.strip()
+        .lower()
+        .replace("d", ":")
+        .replace("°", ":")
+        .replace("'", ":")
+        .replace('"', "")
+    )
+    t = t.replace("m", ":").replace("s", "")
+    sign = -1.0 if t.startswith("-") else 1.0
+    t = t.lstrip("+-")
+    parts = [p for p in re.split(r"[:\s]+", t) if p]
+    if not parts:
+        raise ValueError("empty Dec")
+    d = float(parts[0])
+    m = float(parts[1]) if len(parts) > 1 else 0.0
+    sec = float(parts[2]) if len(parts) > 2 else 0.0
+    return sign * (abs(d) + m / 60.0 + sec / 3600.0)
+
+
+def _split_radec_pair(s: str) -> Optional[Tuple[str, str]]:
+    """
+    Split one string containing both RA and Dec into two fields.
+
+    Handles:
+      - comma separated:  '12:34:56, +12:34:56'
+      - space/colon mix:  '12:34:56 +12:34:56' or '12 34 56 +12 34 56'
+      - 'hms/dms' tokens: '12h34m56s +12d34m56s'
+    Heuristics:
+      - If a token (after the first) begins with +/- or has a degree marker, that
+        token starts Dec.
+      - Else, use RA = first 3 tokens, Dec = rest (common 'hh mm ss dd mm ss').
+      - Fallback: RA = first token when it contains ':' or h/m/s.
+    """
+    if not s:
+        return None
+    parts = re.split(r"\s*,\s*", s.strip(), maxsplit=1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+
+    tokens = [t for t in re.split(r"\s+", s.strip()) if t]
+    if not tokens:
+        return None
+
+    idx = None
+    for i, tok in enumerate(tokens[1:], start=1):
+        if tok.startswith(("+", "-")) or "°" in tok or tok.lower().endswith("d"):
+            idx = i
+            break
+
+    if idx is None:
+        if any(c in tokens[0] for c in (":", "h", "m", "s")):
+            idx = 1
+        elif len(tokens) >= 6:
+            idx = 3
+        elif len(tokens) >= 2:
+            idx = 1
+        else:
+            return None
+
+    ra_s = " ".join(tokens[:idx])
+    dec_s = " ".join(tokens[idx:])
+    return ra_s, dec_s
+
+
+def _parse_star_args(star_opt: Optional[str], ra_opt: Optional[str], dec_opt: Optional[str]) -> Optional[Tuple[float, float]]:
+    """Return (ra_deg, dec_deg) if any valid inputs are provided; otherwise None."""
+    try:
+        if star_opt:
+            pair = _split_radec_pair(star_opt)
+            if pair:
+                ra_s, dec_s = pair
+                return _hms_to_deg(ra_s), _dms_to_deg(dec_s)
+            return None
+        if ra_opt and dec_opt:
+            return _hms_to_deg(ra_opt), _dms_to_deg(dec_opt)
+    except Exception as e:
+        logging.debug(f"Failed to parse star coordinates: {e}")
+        return None
+    return None
+
+
+# ----------------------------- juicer arg parser ------------------------------
+def _parse_juicer_cli_args(argv: List[str]) -> Tuple[Optional[str], Optional[Tuple[float, float]]]:
+    """
+    From a list of args intended for 'juicer', extract:
+      - db_path (first positional, if any)
+      - start_radec tuple from:
+          --star "RA Dec"      or   --star=...
+          --star 00 38 17.56 +42 27 47.2   (unquoted; this function will join)
+          (also supports --ra ... --dec ... as a secondary form)
+    NOTE: --start is NOT supported.
+    """
+    db_path: Optional[str] = None
+    star_opt: Optional[str] = None
+    ra_opt: Optional[str] = None
+    dec_opt: Optional[str] = None
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+
+        # Explicitly reject the old option
+        if a == "--start" or a.startswith("--start="):
+            print("juicer: option '--start' is not supported. Use '--star'.", file=sys.stderr)
+            sys.exit(2)
+
+        # --star=... (single token)
+        if a.startswith("--star="):
+            star_opt = a.split("=", 1)[1]
+            i += 1
+            continue
+
+        # --star (value may span multiple space-separated tokens)
+        if a == "--star":
+            if i + 1 >= len(argv):
+                print("juicer: option '--star' requires an argument", file=sys.stderr)
+                sys.exit(2)
+            j = i + 1
+            star_tokens: List[str] = []
+            while j < len(argv):
+                tok = argv[j]
+                # stop if we hit another option (starts with '-')
+                if tok.startswith("-"):
+                    break
+                star_tokens.append(tok)
+                j += 1
+            # Reassemble the whole RA/Dec string (handles your unquoted form)
+            star_opt = " ".join(star_tokens)
+            i = j
+            continue
+
+        # Optional separate RA/Dec form
+        if a == "--ra":
+            if i + 1 >= len(argv):
+                print("juicer: option '--ra' requires an argument", file=sys.stderr)
+                sys.exit(2)
+            ra_opt = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--ra="):
+            ra_opt = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a == "--dec":
+            if i + 1 >= len(argv):
+                print("juicer: option '--dec' requires an argument", file=sys.stderr)
+                sys.exit(2)
+            dec_opt = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--dec="):
+            dec_opt = a.split("=", 1)[1]
+            i += 1
+            continue
+
+        # first positional (db path)
+        if not a.startswith("-") and db_path is None:
+            db_path = a
+            i += 1
+            continue
+
+        # ignore other args (handled inside juicer if needed)
+        i += 1
+
+    start_radec = _parse_star_args(star_opt, ra_opt, dec_opt)
+    return db_path, start_radec
+
+
+# -----------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main entry point for yuzu command."""
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Normalize/expand variables and globs first so IDEs (which don't glob) work
+    argv = _expand_args(argv)
+
+    # Pull global --config/-c before we import any UI modules
+    cfg_path_opt, argv = _extract_global_config(argv)
+    _rebind_cfg_if_requested(cfg_path_opt)
+
+    # Support running as either 'yuzu juicer ...' or directly as 'juicer ...'
+    invoked = Path(sys.argv[0]).name.lower()
+    invoked_as_juicer = invoked.startswith("juicer")
+
+    name = Path(sys.argv[0]).name
+
+    if invoked_as_juicer:
+        command = "juicer"
+        args = argv
+    else:
+        if len(argv) == 0 or (len(argv) == 1 and argv[0] in ("--help", "-h")):
+            show_help(name)
+            return 0
+
+        # Check for --version
+        if "--version" in argv or "-V" in argv:
+            print(f"{name} version 2.0.0 (Python 3)")
+            return 0
+
+        command = argv[0]
+        args = argv[1:]
+
+    if command not in LEMON_COMMANDS:
+        print(f"{name}: '{command}' is not a yuzu command. See '{name} --help'.")
+        matches = difflib.get_close_matches(command, LEMON_COMMANDS)
+        if matches:
+            print("Did you mean", end=" ")
+            print("this?" if len(matches) == 1 else "one of these?")
+            for match in matches:
+                print(" " * 8 + match)
+        return 1
+
+    # Special handling for juicer
+    if command == "juicer":
+        # Desktop accessibility bus is often unavailable in headless/sandboxed
+        # sessions used for CLI launches. Disable a11y bridge unless caller
+        # explicitly requested another mode, avoiding noisy Gtk warnings.
+        os.environ.setdefault("GTK_A11Y", "none")
+        os.environ.setdefault("NO_AT_BRIDGE", "1")
+        # GTK4 probes GL/EGL during startup and emits noisy DRI3 warnings in
+        # software-rendered or remote sessions. Keep juicer on pure software
+        # rendering unless caller explicitly overrides these knobs.
+        os.environ.setdefault("GSK_RENDERER", "cairo")
+        os.environ.setdefault("GDK_DISABLE", "gl,vulkan,egl")
+
+        # Parse juicer-specific CLI bits here and pass as kwargs
+        db_path, start_radec = _parse_juicer_cli_args(args)
+
+        # ---- sanitize sys.argv BEFORE importing juicer ----
+        # Keep only the program name and (optionally) the db path so that
+        # juicer.main's own argparse doesn't see --star/--ra/--dec.
+        sanitized_argv = [sys.argv[0]]
+        if db_path:
+            sanitized_argv.append(db_path)
+        sys.argv = sanitized_argv
+
+        # Local import AFTER sanitizing argv to avoid side-effect parsing
+        try:
+            import juicer.main  # type: ignore
+        except ImportError as e:
+            logging.error(f"Cannot load juicer module: {e}")
+            print(f"{name}: Error loading juicer. Make sure it's installed.", file=sys.stderr)
+            return 2
+
+        kwargs = {}
+        if db_path:
+            kwargs["db_path"] = db_path
+        if start_radec:
+            kwargs["start_radec"] = start_radec
+
+        try:
+            juicer.main.main(**kwargs)  # type: ignore[arg-type]
+        except Exception as e:
+            logging.error(f"Juicer failed: {e}")
+            return 1
+        return 0
+
+    # Special handling for diffphot (directly available)
+    if command == "diffphot":
+        # Make subcommand visible in child module's usage
+        sys.argv[0] = f"{name} {command}"
+
+        try:
+            import diffphot
+        except ImportError as e:
+            logging.error(f"Cannot load diffphot module: {e}")
+            print(f"{name}: Error loading diffphot. Make sure diffphot.py is in the module path.", file=sys.stderr)
+            return 2
+
+        try:
+            return diffphot.main(args)
+        except Exception as e:
+            logging.error(f"diffphot failed: {e}")
+            return 1
+
+    # Special handling for photometry (directly available)
+    if command == "photometry":
+        # Make subcommand visible in child module's usage
+        sys.argv[0] = f"{name} {command}"
+
+        try:
+            import photometry
+        except ImportError as e:
+            logging.error(f"Cannot load photometry module: {e}")
+            print(f"{name}: Error loading photometry. Make sure photometry.py is in the module path.", file=sys.stderr)
+            return 2
+
+        try:
+            return photometry.main(args)
+        except Exception as e:
+            logging.error(f"photometry failed: {e}")
+            return 1
+
+    # Make subcommand visible in child module's usage
+    sys.argv[0] = f"{name} {command}"
+
+    # Import subcommand module and run its main()
+    try:
+        module = importlib.import_module(command)
+    except ModuleNotFoundError as e:
+        logging.error(f"Cannot load command module '{command}': {e}")
+        print(f"{name}: Error loading '{command}' module.", file=sys.stderr)
+        print(f"Make sure the module is installed and in the Python path.", file=sys.stderr)
+        return 2
+
+    if hasattr(module, "main"):
+        try:
+            result = module.main(args)  # type: ignore[attr-defined]
+            return result if isinstance(result, int) else 0
+        except Exception as e:
+            logging.error(f"Command '{command}' failed: {e}")
+            return 1
+    else:
+        logging.error(f"Module '{command}' has no main(args) function.")
+        print(f"{name}: Module '{command}' does not have a main() function.", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

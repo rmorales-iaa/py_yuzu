@@ -14,4 +14,4 @@ init:
 	pipenv --two --site-packages && PIP_IGNORE_INSTALLED=1 pipenv install
 
 test:
-	pipenv run run_tests.py
+	pipenv run python test/run_tests.py
