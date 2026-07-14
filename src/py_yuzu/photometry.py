@@ -36,6 +36,8 @@ from collections import namedtuple
 from pathlib import Path
 
 # third-party
+import astropy.coordinates
+import astropy.units as u
 import numpy
 
 # project modules (provided by user)
@@ -551,6 +553,8 @@ coords_group = parser.add_argument_group(
 )
 coords_group.add_argument("--coordinates", action="store", type=str, dest="coordinates", default=None,
                           help="path to file containing celestial coordinates for photometry")
+coords_group.add_argument("--object-pos", action="store", type=str, dest="object_pos", default=None,
+                          help="target RA/Dec (sexagesimal); add it to detected source coordinates")
 coords_group.add_argument("--epoch", action="store", type=int, dest="epoch", default=2000,
                           help="epoch of the coordinates [default: %(default)s]")
 
@@ -662,7 +666,13 @@ def main(arguments=None):
             return 1
         print(f"{style.prefix}Using {len(sources_coordinates)} coordinates from file.")
     else:
-        print(f"{style.prefix}No --coordinates provided; detecting sources on the first image with SExtractor...")
+        if options.object_pos:
+            print(
+                f"{style.prefix}No --coordinates provided; detecting sources on the first image with "
+                "SExtractor, then verifying target from --object-pos..."
+            )
+        else:
+            print(f"{style.prefix}No --coordinates provided; detecting sources on the first image with SExtractor...")
         # Work on a temporary copy to let FITSeeingImage write header keywords
         basename = os.path.basename(sources_img_path)
         root, extension = os.path.splitext(basename)
@@ -703,6 +713,27 @@ def main(arguments=None):
             print(f"{style.prefix}{sources_img.filtered} detections ({fpct:.2f} %) were filtered by detection criteria.")
         rpct = len(sources_img) / float(sources_img.total) * 100.0
         print(f"{style.prefix}There remain {len(sources_img)} sources ({rpct:.2f} %) on which to do photometry.")
+
+    if options.object_pos:
+        try:
+            skycoord = astropy.coordinates.SkyCoord(
+                options.object_pos, unit=(u.hourangle, u.deg), frame="icrs"
+            )
+            target_coordinate = astromatic.Coordinates(
+                float(skycoord.ra.deg), float(skycoord.dec.deg)
+            )
+        except Exception as exc:
+            print(f"{style.prefix}Error. Cannot parse --object-pos {options.object_pos!r}: {exc}")
+            print(style.error_exit_message)
+            return 1
+
+        # Keep SExtractor ensemble intact. Add target only when missing.
+        match_radius_deg = 0.5 / 3600.0
+        if any(target_coordinate.distance(coord) <= match_radius_deg for coord in sources_coordinates):
+            print(f"{style.prefix}Target from --object-pos already present in source coordinates.")
+        else:
+            sources_coordinates.append(target_coordinate)
+            print(f"{style.prefix}Added target from --object-pos to source coordinates.")
 
     options.coordinates = sources_coordinates
 

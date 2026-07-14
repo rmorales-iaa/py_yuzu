@@ -1,5 +1,27 @@
 There is a port of LEMON to Python3 and GTK4 of [LEMON, the differential photometry pipeline](https://github.com/vterron/lemon)
 
+## Pipeline execution
+
+Run complete pipeline (default):
+
+```bash
+./run_yuzu.bash
+```
+
+Run exactly one step:
+
+```bash
+./run_yuzu.bash mosaic
+./run_yuzu.bash photometry /data/fits HAT-P-16
+./run_yuzu.bash diffphot
+./run_yuzu.bash juicer
+```
+
+Available steps: `mosaic`, `photometry`, `diffphot`, and `juicer`. A selected
+step expects output from its prerequisite steps in the object output directory.
+`--object-pos "RA DEC"` is passed to photometry and Juicer. Photometry keeps
+all SExtractor sources for comparison stars and adds target only if absent.
+
 ## Millimagnitude differential photometry
 
 `diffphot` now supports two high-level comparison-star profiles:

@@ -1585,62 +1585,73 @@ def main(argv: Optional[List[str]] = None) -> int:
         start_time = time.time()
         last_update_time = start_time
 
-        # Use ProcessPoolExecutor for true parallelism (not limited by GIL)
-        with cf.ProcessPoolExecutor(max_workers=workers) as executor:
-            # Submit all batches
-            futures = {}
+        def collect_batch(batch_idx: int, batch_size: int, batch_results, batch_stats) -> None:
+            nonlocal last_update_time
+            results.extend(batch_results)
+
+            for key in all_stats:
+                all_stats[key] += batch_stats[key]
+
+            progress.update(len(batch_results))
+
+            current_time = time.time()
+            if opts.verbose or (current_time - last_update_time >= 2.0):
+                elapsed = current_time - start_time
+                rate = all_stats['completed'] / elapsed if elapsed > 0 else 0
+
+                msg = (f"{style.prefix}  Batch {batch_idx + 1}/{len(batches)} done | "
+                       f"Stars: {all_stats['completed']}/{len(targets)} | "
+                       f"Rate: {rate:.1f} stars/s | "
+                       f"Avg candidates: {all_stats['candidates'] / max(1, all_stats['completed']):.1f}")
+
+                if show_progress:
+                    progress.print_above(msg)
+                elif opts.verbose:
+                    print(msg)
+                last_update_time = current_time
+
+        if workers == 1:
+            # Avoid spawning a process for the explicitly serial mode. This is
+            # required in restricted environments and removes needless IPC.
             for batch_idx, batch in enumerate(batches):
-                future = executor.submit(
-                    _process_filter_batch,
-                    pf, batch, star_points, star_times, airmass_by_time, star_info,
-                    int(opts.min_cmp), robust,
-                    float(opts.worst_fraction), max_cmp, weight_mode,
-                    min_candidate_epoch_fraction, float(opts.min_candidate_snr),
-                    float(opts.max_candidate_sigma), max_candidate_mag_diff,
-                    max_candidate_distance, bool(opts.detrend_airmass),
-                    broeg_strict, broeg_convergence, broeg_max_iters,
-                    dbg_star
-                )
-                futures[future] = (batch_idx, len(batch))
-
-            # Collect results as they complete with detailed progress
-            completed_batches = 0
-            for future in cf.as_completed(futures):
-                batch_idx, batch_size = futures[future]
                 try:
-                    batch_results, batch_stats = future.result()
-                    results.extend(batch_results)
-
-                    # Update aggregate statistics
-                    for key in all_stats:
-                        all_stats[key] += batch_stats[key]
-
-                    completed_batches += 1
-                    progress.update(len(batch_results))
-
-                    # Print detailed progress every 2 seconds or when verbose
-                    current_time = time.time()
-                    if opts.verbose or (current_time - last_update_time >= 2.0):
-                        elapsed = current_time - start_time
-                        rate = all_stats['completed'] / elapsed if elapsed > 0 else 0
-
-                        msg = (f"{style.prefix}  Batch {completed_batches}/{len(batches)} done | "
-                               f"Stars: {all_stats['completed']}/{len(targets)} | "
-                               f"Rate: {rate:.1f} stars/s | "
-                               f"Avg candidates: {all_stats['candidates'] / max(1, all_stats['completed']):.1f}")
-
-                        if show_progress:
-                            progress.print_above(msg)
-                        elif opts.verbose:
-                            print(msg)
-
-                        last_update_time = current_time
-
+                    batch_results, batch_stats = _process_filter_batch(
+                        pf, batch, star_points, star_times, airmass_by_time, star_info,
+                        int(opts.min_cmp), robust, float(opts.worst_fraction), max_cmp,
+                        weight_mode, min_candidate_epoch_fraction,
+                        float(opts.min_candidate_snr), float(opts.max_candidate_sigma),
+                        max_candidate_mag_diff, max_candidate_distance,
+                        bool(opts.detrend_airmass), broeg_strict, broeg_convergence,
+                        broeg_max_iters, dbg_star,
+                    )
+                    collect_batch(batch_idx, len(batch), batch_results, batch_stats)
                 except Exception as e:
                     logging.error(f"Batch {batch_idx} processing failed: {e}")
-                    completed_batches += 1
-                    progress.update(batch_size)
-                    # Continue with other batches
+                    progress.update(len(batch))
+        else:
+            # Use processes for CPU-bound curve construction when requested.
+            with cf.ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_filter_batch,
+                        pf, batch, star_points, star_times, airmass_by_time, star_info,
+                        int(opts.min_cmp), robust, float(opts.worst_fraction), max_cmp,
+                        weight_mode, min_candidate_epoch_fraction,
+                        float(opts.min_candidate_snr), float(opts.max_candidate_sigma),
+                        max_candidate_mag_diff, max_candidate_distance,
+                        bool(opts.detrend_airmass), broeg_strict, broeg_convergence,
+                        broeg_max_iters, dbg_star,
+                    ): (batch_idx, len(batch))
+                    for batch_idx, batch in enumerate(batches)
+                }
+                for future in cf.as_completed(futures):
+                    batch_idx, batch_size = futures[future]
+                    try:
+                        batch_results, batch_stats = future.result()
+                        collect_batch(batch_idx, batch_size, batch_results, batch_stats)
+                    except Exception as e:
+                        logging.error(f"Batch {batch_idx} processing failed: {e}")
+                        progress.update(batch_size)
 
         progress.finish()
 
